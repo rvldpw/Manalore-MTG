@@ -797,6 +797,21 @@ div[data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]) > div[data-te
 .legendrow{font-family:'IBM Plex Mono';font-size:11px;color:#8c97a5;margin:2px 0 10px;display:flex;gap:16px;flex-wrap:wrap}
 .legendrow b{color:#ece6d6;font-weight:500}
 .swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:middle}
+/* ---------- centered masthead ---------- */
+.masthead{text-align:center;margin:6px auto 4px;max-width:760px}
+.masthead .crest{font-size:40px;line-height:1;color:#d9a850;margin-bottom:2px;
+  text-shadow:0 0 18px rgba(217,168,80,.45)}
+.masthead .wordmark{font-family:'Cinzel',serif;font-weight:700;color:#f0d292;
+  font-size:3.1rem;letter-spacing:.32em;text-indent:.32em;line-height:1.05;margin:0}
+.masthead .subtitle{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:4px;
+  color:#8c97a5;margin-top:8px}
+.masthead .statusbar{justify-content:center;margin-top:8px}
+.masthead .mast-divider{height:1px;width:200px;margin:16px auto 2px;
+  background:linear-gradient(90deg,transparent,#d9a850,transparent);opacity:.6}
+@media (max-width:640px){
+  .masthead .wordmark{font-size:2rem;letter-spacing:.2em;text-indent:.2em}
+  .masthead .crest{font-size:30px}
+}
 /* ---------- mobile (phones like iPhone SE, <= 640px) ---------- */
 @media (max-width: 640px){
   .block-container{padding-left:.7rem!important;padding-right:.7rem!important}
@@ -840,14 +855,6 @@ def score_color(v):
 
 
 # ---- header ----
-hc1, hc2 = st.columns([1, 11])
-with hc1:
-    st.markdown("<div style='font-size:46px;line-height:1;color:#d9a850;text-align:center;margin-top:4px'>✦</div>",
-                unsafe_allow_html=True)
-with hc2:
-    st.markdown("# MANALORE")
-    st.markdown("<div class='cap'>ACADEMY OF CARD MASTERY</div>", unsafe_allow_html=True)
-
 with st.spinner("Opening the library..."):
     POOL = [c for c in load_library() if c.get("name")]
 
@@ -857,8 +864,14 @@ if not POOL:
 
 stamp = time.strftime("%I:%M %p").lstrip("0")
 st.markdown(
-    f"<div class='statusbar'><span class='dot'>●</span> Live market data, last updated {stamp} "
-    f"&nbsp;·&nbsp; tracking the {len(POOL):,} most-played cards</div>",
+    "<div class='masthead'>"
+    "<div class='crest'>✦</div>"
+    "<div class='wordmark'>MANALORE</div>"
+    "<div class='subtitle'>ACADEMY OF CARD MASTERY</div>"
+    f"<div class='statusbar'><span class='dot'>●</span> Live market data, updated {stamp}"
+    f"&nbsp;&nbsp;·&nbsp;&nbsp;tracking the {len(POOL):,} most-played cards</div>"
+    "<div class='mast-divider'></div>"
+    "</div>",
     unsafe_allow_html=True)
 
 tab_lib, tab_look, tab_sets, tab_build, tab_market, tab_academy = st.tabs(
