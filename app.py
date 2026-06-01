@@ -122,6 +122,52 @@ def load_sets():
         return []
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_full_set(code, unique="prints"):
+    """Fetch every card in a set once, then we filter in memory for instant UX."""
+    cards, url = [], f"{API}/cards/search"
+    params = {"q": f"e:{code}", "order": "set", "unique": unique}
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=20)
+        if not r.ok:
+            return []
+        d = r.json()
+        cards.extend(d.get("data", []))
+        pages = 0
+        while d.get("has_more") and pages < 8:
+            time.sleep(0.07)
+            r = requests.get(d["next_page"], headers=HEADERS, timeout=20)
+            if not r.ok:
+                break
+            d = r.json()
+            cards.extend(d.get("data", []))
+            pages += 1
+    except requests.RequestException:
+        return cards
+    for c in cards:
+        c["_f"] = features(c)
+    return cards
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def print_history(card_name):
+    """All printings of a card across sets, newest first, with set + price."""
+    try:
+        r = requests.get(f"{API}/cards/search",
+                         params={"q": f'!"{card_name}"', "unique": "prints", "order": "released"},
+                         headers=HEADERS, timeout=20)
+        if not r.ok:
+            return []
+        rows = []
+        for c in r.json().get("data", []):
+            rows.append({"Set": c.get("set_name", ""), "Code": c.get("set", "").upper(),
+                         "Released": c.get("released_at", ""), "Rarity": c.get("rarity", "").title(),
+                         "Price": price_now(c)})
+        return rows
+    except requests.RequestException:
+        return []
+
+
 # Strategy -> Scryfall oracle/type filters, used to search the WHOLE game
 STRAT_FILTER = {
     "Aggro": '(t:creature mv<=3)',
@@ -201,6 +247,53 @@ def fmt_usd(v):
     if v is None:
         return "-"
     return f"${v:.2f}" if v < 10 else f"${round(v):,}"
+
+
+# ---- card attribute helpers (for filtering / origin) ----
+COLOR_NAMES = {"W": "White", "U": "Blue", "B": "Black", "R": "Red", "G": "Green"}
+
+
+def has_foil(c):
+    return "foil" in (c.get("finishes") or []) or bool(c.get("foil"))
+
+
+def has_nonfoil(c):
+    return "nonfoil" in (c.get("finishes") or []) or bool(c.get("nonfoil"))
+
+
+def treatment(c):
+    fe = c.get("frame_effects") or []
+    pt = c.get("promo_types") or []
+    if c.get("border_color") == "borderless":
+        return "Borderless"
+    if "showcase" in fe:
+        return "Showcase"
+    if "extendedart" in fe:
+        return "Extended"
+    if c.get("full_art"):
+        return "Full art"
+    if "serialized" in pt:
+        return "Serialized"
+    if "etched" in (c.get("finishes") or []):
+        return "Etched"
+    return "Standard"
+
+
+def color_category(c):
+    ci = c.get("color_identity", [])
+    if not ci:
+        return "Colorless"
+    if len(ci) > 1:
+        return "Multicolor"
+    return COLOR_NAMES.get(ci[0], "Colorless")
+
+
+def primary_type(c):
+    tl = type_line(c).lower()
+    for t in ["land", "creature", "instant", "sorcery", "artifact", "enchantment", "planeswalker", "battle"]:
+        if t in tl:
+            return t.capitalize()
+    return "Other"
 
 
 # ----------------------------------------------------------------------------
@@ -792,6 +885,23 @@ def card_sheet_body(c):
     for tag, txt in analyst_notes(c):
         st.markdown(f"<div class='note-row'>{label[tag]} &nbsp;{txt}</div>", unsafe_allow_html=True)
 
+    # ---- origin + print history ----
+    st.markdown("**Origin & printings**")
+    o1, o2, o3 = st.columns(3)
+    o1.metric("Original set", c.get("set_name", "Unknown"))
+    o2.metric("Set code", (c.get("set", "") or "").upper())
+    o3.metric("Released", c.get("released_at", "Unknown"))
+    hist = print_history(c["name"])
+    if hist and len(hist) > 1:
+        st.markdown(f"<span class='cap'>This card has {len(hist)} printings. "
+                    "Newer reprints usually ease supply and soften price.</span>", unsafe_allow_html=True)
+        hdf = pd.DataFrame(hist)
+        st.dataframe(hdf, use_container_width=True, hide_index=True, height=min(320, 60 + len(hist) * 35),
+                     column_config={"Price": st.column_config.NumberColumn(format="$%.2f")})
+    elif hist:
+        st.markdown("<span class='cap'>Only one printing so far, so supply is concentrated in this release.</span>",
+                    unsafe_allow_html=True)
+
 
 @st.dialog(" ", width="large")
 def open_card_dialog(c):
@@ -967,32 +1077,79 @@ with tab_sets:
                 st.rerun()
             st.markdown(f"#### {choice['name']} {newness(choice)}", unsafe_allow_html=True)
             st.markdown(f"<span class='cap'>{choice.get('code','').upper()} · released "
-                        f"{choice.get('released_at','TBA')} · {choice['card_count']} cards</span>",
+                        f"{choice.get('released_at','TBA')} · {choice['card_count']} cards in set</span>",
                         unsafe_allow_html=True)
-            booster = st.radio("Booster view", ["All printings", "Play Booster", "Collector Booster"],
-                               horizontal=True, key="booster",
-                               help="Play Boosters are the standard cards. Collector Boosters hold the special "
-                                    "showcase, borderless, extended-art and serialized treatments.")
             code = choice["code"]
-            if booster == "Play Booster":
-                q = f"e:{code} -is:showcase -is:extendedart -is:borderless -is:fullart -is:serialized"
-                order, uniq = "edhrec", "cards"
-                note = "Standard versions as they appear in Play Boosters, most-played first."
-            elif booster == "Collector Booster":
-                q = f"e:{code} (is:showcase or is:extendedart or is:borderless or is:fullart or is:serialized or is:etched)"
-                order, uniq = "usd", "prints"
-                note = "Collector Booster treatments: showcase, borderless, extended-art, full-art, etched and serialized, priciest first."
+            with st.spinner("Loading every card in this set..."):
+                all_cards = load_full_set(code, unique="prints")
+            if not all_cards:
+                st.info("Could not load this set right now. Please reload in a moment.")
             else:
-                q, order, uniq = f"e:{code}", "usd", "prints"
-                note = "Every printing in this set, most valuable first."
-            st.markdown(f"<span class='note'>{note}</span>", unsafe_allow_html=True)
-            with st.spinner("Drawing the cards..."):
-                set_cards = scry_search(q, order=order, unique=uniq, limit=120)
-            if not set_cards:
-                st.info("No cards found for this view. Try All printings.")
-            else:
-                st.markdown(f"<span class='cap'>{len(set_cards)} cards · showing 50</span>", unsafe_allow_html=True)
-                card_tiles(set_cards, "set", 5, 50)
+                fr1 = st.columns([2, 1, 1, 1])
+                name_in = fr1[0].text_input("Search this set", "", key="setcard_q",
+                                            placeholder="Type a card name...")
+                finish = fr1[1].selectbox("Finish", ["Any", "Foil", "Non-foil"], key="set_finish")
+                booster = fr1[2].selectbox("Booster", ["All", "Play Booster", "Collector Booster"], key="set_boost",
+                                           help="Play Booster shows standard versions; Collector shows special treatments.")
+                sort_by = fr1[3].selectbox("Sort", ["Most played", "Price high", "Price low", "Name", "Mana value"],
+                                           key="set_sort")
+                fr2 = st.columns(5)
+                rarities = sorted({c.get("rarity", "").title() for c in all_cards if c.get("rarity")})
+                rarity_pick = fr2[0].multiselect("Rarity", rarities, key="set_rarity")
+                color_pick = fr2[1].multiselect("Color", ["White", "Blue", "Black", "Red", "Green", "Multicolor", "Colorless"],
+                                                key="set_color")
+                type_pick = fr2[2].multiselect("Type", ["Creature", "Instant", "Sorcery", "Artifact",
+                                                        "Enchantment", "Planeswalker", "Land", "Battle"], key="set_type2")
+                mvs = sorted({min(8, int(c.get("cmc", 0))) for c in all_cards})
+                mv_pick = fr2[3].multiselect("Mana value", [(f"{m}" if m < 8 else "8+") for m in mvs], key="set_mv")
+                legal_pick = fr2[4].multiselect("Legal in", [f.title() for f in FMTS], key="set_legal")
+
+                def keep(c):
+                    if name_in and name_in.lower() not in c["name"].lower():
+                        return False
+                    if finish == "Foil" and not has_foil(c):
+                        return False
+                    if finish == "Non-foil" and not has_nonfoil(c):
+                        return False
+                    if booster == "Play Booster" and treatment(c) != "Standard":
+                        return False
+                    if booster == "Collector Booster" and treatment(c) == "Standard":
+                        return False
+                    if rarity_pick and c.get("rarity", "").title() not in rarity_pick:
+                        return False
+                    if color_pick and color_category(c) not in color_pick:
+                        return False
+                    if type_pick and primary_type(c) not in type_pick:
+                        return False
+                    if mv_pick:
+                        mv = min(8, int(c.get("cmc", 0)))
+                        if (f"{mv}" if mv < 8 else "8+") not in mv_pick:
+                            return False
+                    if legal_pick:
+                        lf = {f.title() for f in legal_formats(c)}
+                        if not any(lp in lf for lp in legal_pick):
+                            return False
+                    return True
+
+                filtered = [c for c in all_cards if keep(c)]
+                sort_key = {
+                    "Most played": lambda c: -importance(c),
+                    "Price high": lambda c: -(price_now(c) or 0),
+                    "Price low": lambda c: (price_now(c) or 1e9),
+                    "Name": lambda c: c["name"],
+                    "Mana value": lambda c: c.get("cmc", 0),
+                }[sort_by]
+                filtered.sort(key=sort_key)
+
+                active = any([name_in, finish != "Any", booster != "All", rarity_pick, color_pick,
+                              type_pick, mv_pick, legal_pick])
+                st.markdown(f"<span class='cap'>{len(filtered)} of {len(all_cards)} printings"
+                            f"{' · filtered' if active else ' · showing all'}</span>", unsafe_allow_html=True)
+                if not filtered:
+                    st.info("No cards match these filters. Clear a filter to see more.")
+                else:
+                    show_n = st.slider("How many to show", 20, 200, 60, 20, key="set_show")
+                    card_tiles(filtered, "set", 5, show_n)
         else:
             c1, c2 = st.columns([1, 2])
             set_type = c1.selectbox("Category", ["All", "Expansion", "Commander", "Masters", "Other"])
