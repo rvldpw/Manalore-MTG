@@ -367,6 +367,253 @@ def deck_name(cols, arch):
 
 
 # ----------------------------------------------------------------------------
+# DECK INTELLIGENCE ENGINE
+# ----------------------------------------------------------------------------
+# Recommended non-land role mix per strategy (as fractions of the spell slots),
+# and target land counts. Used to build synergy-first decks and to grade them.
+STRAT_PROFILE = {
+    "Aggro":    {"roles": {"Threat": .62, "Removal": .20, "Card Advantage": .10, "Disruption": .08},
+                 "curve": {0: .05, 1: .26, 2: .34, 3: .22, 4: .09, 5: .04}, "lands60": 22, "lands100": 34, "tagline": "go fast and close before the opponent stabilizes"},
+    "Midrange": {"roles": {"Threat": .42, "Removal": .26, "Card Advantage": .16, "Ramp": .08, "Disruption": .08},
+                 "curve": {1: .10, 2: .26, 3: .26, 4: .20, 5: .12, 6: .06}, "lands60": 24, "lands100": 37, "tagline": "trade efficiently, then win with stronger cards"},
+    "Control":  {"roles": {"Removal": .30, "Counter": .22, "Card Advantage": .30, "Engine": .12, "Threat": .06},
+                 "curve": {1: .12, 2: .26, 3: .24, 4: .18, 5: .12, 6: .08}, "lands60": 26, "lands100": 38, "tagline": "answer everything, win late with inevitability"},
+    "Combo":    {"roles": {"Engine": .30, "Card Advantage": .26, "Ramp": .20, "Disruption": .14, "Counter": .10},
+                 "curve": {1: .16, 2: .28, 3: .26, 4: .16, 5: .08, 6: .06}, "lands100": 36, "lands60": 23, "tagline": "assemble the engine, protect it, and combo off"},
+}
+
+
+def deck_lands(strategy, deck_size):
+    prof = STRAT_PROFILE.get(strategy, STRAT_PROFILE["Midrange"])
+    return prof["lands100"] if deck_size >= 100 else prof["lands60"]
+
+
+def role_targets(strategy, spell_slots):
+    """Recommended card counts by role for the chosen strategy."""
+    prof = STRAT_PROFILE.get(strategy, STRAT_PROFILE["Midrange"])
+    return {r: max(1, round(frac * spell_slots)) for r, frac in prof["roles"].items()}
+
+
+def synergy_score(cards, strategy):
+    """0-100. Rewards cards whose role fits the strategy profile and shared colors."""
+    if not cards:
+        return 0
+    prof = STRAT_PROFILE.get(strategy, STRAT_PROFILE["Midrange"])
+    wanted = set(prof["roles"].keys())
+    on_plan = sum(1 for c in cards if (("Other" if role(c) == "Spell" else role(c)) in wanted or "land" in type_line(c).lower()))
+    on_plan_frac = on_plan / len(cards)
+    # color cohesion: fewer distinct colors among nonland cards is tighter
+    cols = set()
+    for c in cards:
+        cols.update(c.get("color_identity", []))
+    cohesion = 1.0 if len(cols) <= 2 else 0.85 if len(cols) == 3 else 0.65 if len(cols) == 4 else 0.5
+    return round(clamp(on_plan_frac * 78 + cohesion * 22, 0, 100))
+
+
+def consistency_score(cards, strategy, deck_size):
+    """0-100. Rewards a smooth curve vs the target, and proper quantities over singletons."""
+    spells = [c for c in cards if "land" not in type_line(c).lower()]
+    if not spells:
+        return 0
+    prof = STRAT_PROFILE.get(strategy, STRAT_PROFILE["Midrange"])
+    target = prof["curve"]
+    actual = {}
+    for c in spells:
+        b = min(6, int(c.get("cmc", 0)))
+        actual[b] = actual.get(b, 0) + 1
+    n = len(spells)
+    # curve distance (lower is better)
+    dist = 0
+    for b in range(7):
+        want = target.get(b, 0)
+        have = actual.get(b, 0) / n
+        dist += abs(want - have)
+    curve_fit = clamp(1 - dist, 0, 1)
+    # quantity: singleton-heavy 60-card decks are less consistent; commander is singleton by rule
+    if deck_size < 100:
+        names = [c["name"] for c in spells]
+        from collections import Counter
+        cnt = Counter(names)
+        multi = sum(v for v in cnt.values() if v >= 2)
+        qty = clamp(multi / max(1, len(spells)), 0, 1)
+        return round(clamp(curve_fit * 65 + qty * 35, 0, 100))
+    return round(clamp(curve_fit * 100, 0, 100))
+
+
+def curve_score(cards, strategy):
+    return consistency_score(cards, strategy, 60)  # curve component reused
+
+
+def budget_label(value):
+    return "Budget" if value <= 50 else "Mid" if value <= 200 else "High-end"
+
+
+def win_condition(cards, strategy):
+    """Pick the most plausible win condition from the deck's contents."""
+    def uniq_names(lst, k):
+        seen, out = set(), []
+        for c in lst:
+            if c["name"] not in seen:
+                seen.add(c["name"]); out.append(c["name"])
+            if len(out) >= k:
+                break
+        return out
+    threats = sorted([c for c in cards if role(c) == "Threat"], key=lambda c: -importance(c))
+    engines = [c for c in cards if role(c) == "Engine"]
+    if strategy == "Aggro":
+        top = ", ".join(uniq_names(threats, 3))
+        return f"Win by attacking fast with cheap threats like {top or 'your creatures'} before the opponent stabilizes."
+    if strategy == "Control":
+        return ("Win late: answer every threat, pull ahead on cards, then close with a few resilient finishers like "
+                + (", ".join(uniq_names(threats, 2)) or "your top-end threats") + ".")
+    if strategy == "Combo":
+        return ("Win by assembling your engine (" + (", ".join(uniq_names(engines, 2)) or "key pieces")
+                + "), protecting it, and converting it into a game-ending loop or burst.")
+    top = ", ".join(uniq_names(threats, 3))
+    return f"Win by trading efficiently, then taking over with stronger midrange threats like {top or 'your best creatures'}."
+
+
+def deck_quality(cards, strategy, deck_size, value, brief_match):
+    syn = synergy_score(cards, strategy)
+    con = consistency_score(cards, strategy, deck_size)
+    avg_imp = np.mean([importance(c) for c in cards]) if cards else 0
+    # budget efficiency: power per dollar, normalized
+    bud_eff = clamp((avg_imp / max(8, (value / max(1, len(cards))) + 8)) * 22, 0, 100)
+    overall = round(0.30 * syn + 0.24 * con + 0.20 * avg_imp + 0.12 * bud_eff + 0.14 * brief_match)
+    return {"synergy": syn, "consistency": con, "power": round(avg_imp),
+            "budget_eff": round(bud_eff), "alignment": round(brief_match), "overall": clamp(overall, 0, 100)}
+
+
+def decklist_csv(used, lands, cols):
+    """Return a CSV string: Qty,Card,Role,Type,MV,Price."""
+    from collections import Counter
+    lines = ["Qty,Card,Role,Type,ManaValue,PriceUSD"]
+    cnt = Counter(c["name"] for c in used)
+    seen = set()
+    for c in used:
+        if c["name"] in seen:
+            continue
+        seen.add(c["name"])
+        nm = c["name"].replace('"', "'")
+        lines.append(f'{cnt[c["name"]]},"{nm}",{role(c)},"{type_line(c)}",{int(c.get("cmc",0))},{price_now(c) or 0:.2f}')
+    lines.append(f'{lands},"Lands ({"".join(cols) or "C"})",Land,Land,0,0.00')
+    return "\n".join(lines)
+
+
+def deck_report_txt(name, brief, q, used, lands, value, cols, strategy, deck_size):
+    from collections import Counter
+    role_counts = Counter(("Other" if role(c) == "Spell" else role(c)) for c in used)
+    lines = [
+        f"MANALORE DECK REPORT", "=" * 48, name, brief, "",
+        f"Format size: {len(used) + lands} cards ({len(used)} spells / {lands} lands)",
+        f"Colors: {guild_name(cols)}    Est. value: ${value:.0f} ({budget_label(value)})", "",
+        "QUALITY SCORES (0-100)",
+        f"  Overall        {q['overall']}",
+        f"  Synergy        {q['synergy']}",
+        f"  Consistency    {q['consistency']}",
+        f"  Avg power      {q['power']}",
+        f"  Budget eff.    {q['budget_eff']}",
+        f"  Brief match    {q['alignment']}", "",
+        "WIN CONDITION", "  " + win_condition(used, strategy), "",
+        "ROLE MIX",
+    ]
+    for r, n in role_counts.most_common():
+        lines.append(f"  {r}: {n}")
+    lines += ["", "DECKLIST"]
+    seen = set()
+    cnt = Counter(c["name"] for c in used)
+    for c in used:
+        if c["name"] in seen:
+            continue
+        seen.add(c["name"])
+        lines.append(f"  {cnt[c['name']]}x {c['name']}  (PWR {importance(c)}, ${price_now(c) or 0:.2f})")
+    lines.append(f"  {lands}x Lands")
+    lines += ["", "Prices are aggregated market values for study, not a quote. Analysis is not financial advice."]
+    return "\n".join(lines)
+
+
+def assemble_deck(starters, candidates, strategy, deck_size):
+    """Synergy-first build: fill role quotas from the candidate pool, then top up.
+    For 60-card decks, run impactful nonland spells as playsets (multiples) for consistency."""
+    lands = deck_lands(strategy, deck_size)
+    spell_slots = deck_size - lands
+    targets = role_targets(strategy, spell_slots)
+
+    # bucket candidates by role, best first
+    buckets = {}
+    for c in candidates:
+        r = "Other" if role(c) == "Spell" else role(c)
+        if "land" in type_line(c).lower():
+            continue
+        buckets.setdefault(r, []).append(c)
+    for r in buckets:
+        buckets[r].sort(key=lambda c: -importance(c))
+
+    used, used_names = [], set()
+
+    def add(card, copies):
+        if card["name"] in used_names or "land" in type_line(card).lower():
+            return 0
+        copies = max(1, min(copies, (4 if deck_size < 100 else 1)))
+        added = 0
+        for _ in range(copies):
+            if len(used) >= spell_slots:
+                break
+            used.append(card); added += 1
+        used_names.add(card["name"])
+        return added
+
+    # 1) seed the user's build-around/favourite cards first
+    for c in starters:
+        add(c, 4 if deck_size < 100 else 1)
+
+    # 2) fill each role toward its target, using multiples in 60-card decks
+    per_copy = 3 if deck_size < 100 else 1
+    for r, want in sorted(targets.items(), key=lambda kv: -kv[1]):
+        have = sum(1 for c in used if ("Other" if role(c) == "Spell" else role(c)) == r)
+        pool = buckets.get(r, [])
+        i = 0
+        while have < want and i < len(pool) and len(used) < spell_slots:
+            got = add(pool[i], per_copy)
+            have += got
+            i += 1
+
+    # 3) top up any remaining slots with the best on-plan cards left
+    leftovers = sorted(
+        [c for r in targets for c in buckets.get(r, [])] + [c for c in candidates if "land" not in type_line(c).lower()],
+        key=lambda c: -importance(c))
+    for c in leftovers:
+        if len(used) >= spell_slots:
+            break
+        add(c, 1)
+
+    return used, lands, spell_slots, targets
+
+
+def validate_deck(used, lands, targets, strategy, deck_size, cols, color_pick):
+    """Return a list of (ok, message) checks confirming the deck matches the brief."""
+    checks = []
+    total = len(used) + lands
+    checks.append((total == deck_size, f"Deck size is {total} (target {deck_size})."))
+    spells = len(used)
+    checks.append((spells >= deck_size - lands - 2, f"{spells} spells filled toward {deck_size - lands}."))
+    # role coverage
+    from collections import Counter
+    rc = Counter(("Other" if role(c) == "Spell" else role(c)) for c in used)
+    covered = sum(1 for r in targets if rc.get(r, 0) >= max(1, int(targets[r] * 0.5)))
+    checks.append((covered >= max(1, len(targets) - 1),
+                   f"{covered}/{len(targets)} core roles for {strategy} are adequately filled."))
+    # color match
+    if color_pick:
+        deck_cols = set()
+        for c in used:
+            deck_cols.update(c.get("color_identity", []))
+        ok = deck_cols.issubset(set(color_pick))
+        checks.append((ok, "All cards fit your chosen colors." if ok else "Some cards fall outside your chosen colors."))
+    return checks
+
+
+# ----------------------------------------------------------------------------
 # THEME
 # ----------------------------------------------------------------------------
 st.set_page_config(page_title="MANALORE", page_icon="✦", layout="wide")
@@ -374,6 +621,11 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@500;600;700&family=Spectral:wght@300;400;500&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 .stApp{background:linear-gradient(180deg,#0b0e12,#0e1319);color:#ece6d6;font-family:'Spectral',serif}
+/* collapse Streamlit chrome for more usable space */
+#MainMenu{visibility:hidden}
+header[data-testid="stHeader"]{height:0;background:transparent}
+footer{visibility:hidden}
+.block-container{padding-top:1.2rem;padding-bottom:2rem;max-width:1400px}
 h1,h2,h3{font-family:'Cinzel',serif!important;color:#f0d292!important;letter-spacing:1.5px}
 [data-testid="stMetricValue"]{font-family:'IBM Plex Mono',monospace;color:#f0d292}
 .stTabs [data-baseweb="tab"]{font-family:'IBM Plex Mono';letter-spacing:1px;text-transform:uppercase;font-size:12px}
@@ -443,6 +695,7 @@ SS = st.session_state
 SS.setdefault("sel_card", None)
 SS.setdefault("basket", [])
 SS.setdefault("set_choice", None)
+SS.setdefault("built_deck", None)
 
 
 def score_color(v):
@@ -777,9 +1030,10 @@ with tab_sets:
 with tab_build:
     st.markdown("### Build a deck")
     st.markdown("<span class='cap'>Tell us the brief, optionally tap a few favourite cards, and we assemble "
-                "a deck from across all of Magic, then name it.</span>", unsafe_allow_html=True)
+                "a synergy-first deck from across all of Magic, grade it, and let you download it.</span>",
+                unsafe_allow_html=True)
 
-    st.markdown("**Step 1 · Your brief**  <span class='cap'>this guides the model</span>", unsafe_allow_html=True)
+    st.markdown("**Step 1 · Your brief**  <span class='cap'>this guides the engine</span>", unsafe_allow_html=True)
     b1, b2 = st.columns(2)
     purpose = b1.selectbox("Purpose", ["Casual", "Competitive", "Budget"],
                            help="Budget keeps cards cheap. Competitive favours format staples.")
@@ -792,24 +1046,44 @@ with tab_build:
     key_card = st.text_input("Build around a key card or commander (optional)",
                              placeholder="e.g. Atraxa, Grand Unifier")
 
+    deck_size = 100 if fmt == "Commander" else 60
+    lands_target = deck_lands(strategy, deck_size)
+    spell_slots = deck_size - lands_target
+
+    # ---- requirements panel (always visible) ----
+    with st.container():
+        st.markdown("**Deck requirements**  "
+                    f"<span class='cap'>{fmt} · {strategy}</span>", unsafe_allow_html=True)
+        rq = st.columns(4)
+        rq[0].metric("Deck size", deck_size, "singleton" if deck_size >= 100 else "up to 4 copies")
+        rq[1].metric("Lands", lands_target)
+        rq[2].metric("Spells", spell_slots)
+        tgts = role_targets(strategy, spell_slots)
+        rq[3].metric("Core roles", len(tgts))
+        rec = " · ".join(f"{r} ~{n}" for r, n in sorted(tgts.items(), key=lambda kv: -kv[1]))
+        st.markdown(f"<span class='cap'>Recommended mix: {rec}</span>", unsafe_allow_html=True)
+
+    # ---- favourites (persistent, no reset) ----
     st.markdown("**Step 2 · Add a few favourites (optional)**", unsafe_allow_html=True)
-    suggest_pool = sorted(POOL, key=lambda c: -importance(c))[:30]
+    picked_n = len(SS["basket"])
+    prog = min(1.0, picked_n / max(1, spell_slots))
+    st.progress(prog, text=f"{picked_n} favourite(s) chosen · we will fill the remaining "
+                           f"{max(0, spell_slots - picked_n)} spell slots for you")
     with st.expander("Browse popular cards to add", expanded=False):
-        rows = (len(suggest_pool) + 4) // 5
-        idx = 0
+        suggest_pool = sorted(POOL, key=lambda c: -importance(c))[:30]
         basket_names = [b["name"] for b in SS["basket"]]
-        for _ in range(rows):
-            cols = st.columns(5)
-            for col in cols:
+        idx = 0
+        for _ in range((len(suggest_pool) + 4) // 5):
+            cols_ = st.columns(5)
+            for col in cols_:
                 if idx >= len(suggest_pool):
                     break
                 c = suggest_pool[idx]; idx += 1
                 with col:
-                    art = img_uri(c, "art_crop")
-                    if art:
-                        st.image(art, use_container_width=True)
+                    art = img_uri(c, "art_crop") or img_uri(c, "normal") or ""
+                    st.markdown(f"<img class='cardart' src='{art}' alt=''>", unsafe_allow_html=True)
                     chosen = c["name"] in basket_names
-                    st.markdown(f"<div class='nm'>{c['name'][:22]}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='tname'>{c['name']}</div>", unsafe_allow_html=True)
                     if st.button("✓ Added" if chosen else "＋ Add", key=f"pick_{idx}_{c.get('id', c['name'])}",
                                  use_container_width=True, type="primary" if chosen else "secondary"):
                         if chosen:
@@ -827,22 +1101,20 @@ with tab_build:
                     SS["basket"].pop(i)
                     st.rerun()
 
+    # ---- build trigger ----
     st.markdown("**Step 3 · Build**")
     cbuild = st.columns([3, 1])
-    deck_size = 100 if fmt == "Commander" else 60
     build = cbuild[0].button(f"⚔  Build my {fmt} deck", use_container_width=True, type="primary")
     if cbuild[1].button("Clear all", use_container_width=True):
         SS["basket"] = []
+        SS["built_deck"] = None
         st.rerun()
 
     if build:
-        # seed key card
         seed = scry_named(key_card) if key_card.strip() else None
         starters = list(SS["basket"])
         if seed and seed.get("name") and seed["name"] not in [s["name"] for s in starters]:
             feats(seed); starters.insert(0, seed)
-
-        # infer colors from picks + seed if not chosen
         cols = list(color_pick)
         if not cols:
             cs = set()
@@ -850,110 +1122,178 @@ with tab_build:
                 cs.update(c.get("color_identity", []))
             cols = [x for x in ["W", "U", "B", "R", "G"] if x in cs]
         colors_key = "".join(sorted(cols))
-
-        with st.spinner(f"Searching all of Magic for the best {strategy.lower()} cards..."):
+        with st.spinner(f"Searching all of Magic for synergistic {strategy.lower()} cards..."):
             candidates = [enrich_card(c) for c in build_candidate_pool(colors_key, strategy, fmt, purpose)]
-
-        lands = 37 if deck_size >= 100 else 24
-        nonland_target = deck_size - lands
-        used, used_names = list(starters), {c["name"] for c in starters}
-        # rank candidates by importance, fitting the brief
-        for c in sorted(candidates, key=lambda c: -importance(c)):
-            if len(used) >= nonland_target:
-                break
-            if c["name"] not in used_names and "land" not in type_line(c).lower():
-                used.append(c); used_names.add(c["name"])
-        # last-resort top-up from the library
-        if len(used) < nonland_target:
-            for c in sorted(POOL, key=lambda c: -importance(c)):
-                if len(used) >= nonland_target:
-                    break
-                if c["name"] not in used_names and "land" not in type_line(c).lower():
-                    used.append(c); used_names.add(c["name"])
-
-        if not used:
-            st.warning("We could not find cards for that brief. Try widening colors or strategy.")
-        else:
+            used, lands, spell_slots2, targets = assemble_deck(starters, candidates, strategy, deck_size)
+            if len(used) < spell_slots2:  # top-up from library if the search was thin
+                names = {c["name"] for c in used}
+                for c in sorted(POOL, key=lambda c: -importance(c)):
+                    if len(used) >= spell_slots2:
+                        break
+                    if c["name"] not in names and "land" not in type_line(c).lower():
+                        used.append(c); names.add(c["name"])
             if not cols:
                 cs = set()
                 for c in used:
                     cs.update(c.get("color_identity", []))
                 cols = [x for x in ["W", "U", "B", "R", "G"] if x in cs]
-            arch = strategy
-            name = deck_name(cols, arch)
+        # store everything in state so popups/reruns never lose the deck
+        SS["built_deck"] = {
+            "used": used, "lands": lands, "targets": targets, "strategy": strategy, "fmt": fmt,
+            "deck_size": deck_size, "cols": cols, "purpose": purpose, "color_pick": color_pick,
+            "seed_name": seed["name"] if seed else None, "fav_n": len(SS["basket"]),
+        }
+
+    # ---- render the built deck from state (survives reruns) ----
+    bd = SS.get("built_deck")
+    if bd:
+        used, lands, targets = bd["used"], bd["lands"], bd["targets"]
+        strategy, fmt, deck_size, cols = bd["strategy"], bd["fmt"], bd["deck_size"], bd["cols"]
+        purpose = bd["purpose"]
+        if not used:
+            st.warning("We could not find cards for that brief. Try widening colors or strategy.")
+        else:
+            name = deck_name(cols, strategy)
             value = sum(price_now(c) or 0 for c in used)
-            avg_imp = round(np.mean([importance(c) for c in used]))
+            # brief match score: roles covered + color fit + format
+            from collections import Counter
+            rc = Counter(("Other" if role(c) == "Spell" else role(c)) for c in used)
+            covered = sum(1 for r in targets if rc.get(r, 0) >= max(1, int(targets[r] * 0.5)))
+            brief_match = clamp(covered / max(1, len(targets)) * 100, 0, 100)
+            q = deck_quality(used, strategy, deck_size, value, brief_match)
 
             st.markdown(f"## {name}")
-            seed_txt = f"built around {seed['name']}, " if seed else ""
-            picks_txt = (f"your {len(SS['basket'])} favourite(s), " if SS["basket"] else "")
-            st.markdown(f"<span class='cap'>A {purpose.lower()} {strategy.lower()} {fmt} deck, {seed_txt}{picks_txt}"
-                        f"drawn from across all of Magic and tuned to {guild_name(cols)}.</span>",
-                        unsafe_allow_html=True)
-            mm1, mm2, mm3, mm4 = st.columns(4)
-            mm1.metric("Deck Size", len(used) + lands, f"{len(used)} spells / {lands} lands")
-            mm2.metric("Est. Spell Value", f"${value:.0f}")
-            mm3.metric("Avg Power", avg_imp)
-            mm4.metric("Colors", "".join(cols) or "C")
+            seed_txt = f"built around {bd['seed_name']}, " if bd.get("seed_name") else ""
+            fav_txt = f"your {bd['fav_n']} favourite(s), " if bd.get("fav_n") else ""
+            st.markdown(f"<span class='cap'>A {purpose.lower()} {strategy.lower()} {fmt} deck, {seed_txt}{fav_txt}"
+                        f"assembled from across all of Magic and tuned to {guild_name(cols)}. "
+                        f"{STRAT_PROFILE.get(strategy, {}).get('tagline','')}.</span>", unsafe_allow_html=True)
 
-            # ---- two charts that make sense ----
+            # ---- quality scorecard ----
+            st.markdown("#### Deck quality")
+            qc = st.columns(6)
+            qc[0].metric("Overall", q["overall"])
+            qc[1].metric("Synergy", q["synergy"])
+            qc[2].metric("Consistency", q["consistency"])
+            qc[3].metric("Avg power", q["power"])
+            qc[4].metric("Budget eff.", q["budget_eff"])
+            qc[5].metric("Brief match", q["alignment"])
+            grade = ("Tournament-ready" if q["overall"] >= 78 else "Strong casual" if q["overall"] >= 64
+                     else "Fun, needs tuning" if q["overall"] >= 50 else "Rough draft")
+            st.markdown(f"<span class='cap'>Verdict: <b class='gold'>{grade}</b>. "
+                        f"Scores blend synergy, consistency, power, budget efficiency and how well the deck matches your brief.</span>",
+                        unsafe_allow_html=True)
+
+            mm1, mm2, mm3, mm4 = st.columns(4)
+            mm1.metric("Deck size", len(used) + lands, f"{len(used)} spells / {lands} lands")
+            mm2.metric("Est. value", f"${value:.0f}", budget_label(value))
+            mm3.metric("Colors", guild_name(cols))
+            mm4.metric("Win speed", {"Aggro": "Fast", "Midrange": "Medium", "Control": "Slow", "Combo": "Explosive"}[strategy])
+
+            # ---- validation ----
+            st.markdown("#### Validation  <span class='cap'>does the deck match your brief?</span>", unsafe_allow_html=True)
+            for ok, msg in validate_deck(used, lands, targets, strategy, deck_size, cols, bd["color_pick"]):
+                st.markdown(f"<div class='note-row'>{'🟢' if ok else '🔴'} &nbsp;{msg}</div>", unsafe_allow_html=True)
+
+            # ---- charts ----
             ch1, ch2 = st.columns(2)
             try:
                 import altair as alt
                 with ch1:
-                    st.markdown("**Mana curve**  <span class='cap'>how many cards at each cost</span>",
-                                unsafe_allow_html=True)
+                    st.markdown("**Mana curve**  <span class='cap'>cards at each cost</span>", unsafe_allow_html=True)
                     cv = {}
                     for c in used:
-                        k = min(7, int(c.get("cmc", 0)))
-                        cv[k] = cv.get(k, 0) + 1
+                        k = min(7, int(c.get("cmc", 0))); cv[k] = cv.get(k, 0) + 1
                     cvdf = pd.DataFrame({"Mana value": [(f"{k}" if k < 7 else "7+") for k in range(8)],
                                          "Cards": [cv.get(k, 0) for k in range(8)]})
-                    bar = (alt.Chart(cvdf).mark_bar(color=ACCENT, cornerRadius=3)
-                           .encode(x=alt.X("Mana value:N", sort=None, title="Mana value"),
-                                   y=alt.Y("Cards:Q", title="Cards"),
-                                   tooltip=["Mana value", "Cards"]).properties(height=240))
-                    st.altair_chart(bar, use_container_width=True)
+                    st.altair_chart((alt.Chart(cvdf).mark_bar(color=ACCENT, cornerRadius=3)
+                                     .encode(x=alt.X("Mana value:N", sort=None), y=alt.Y("Cards:Q"),
+                                             tooltip=["Mana value", "Cards"]).properties(height=230)),
+                                    use_container_width=True)
                 with ch2:
-                    st.markdown("**Role mix**  <span class='cap'>what jobs the cards do</span>", unsafe_allow_html=True)
-                    rc = {}
+                    st.markdown("**Color split**  <span class='cap'>mana symbols in the deck</span>", unsafe_allow_html=True)
+                    pip = {"W": 0, "U": 0, "B": 0, "R": 0, "G": 0}
                     for c in used:
-                        r = "Other" if role(c) == "Spell" else role(c)
-                        rc[r] = rc.get(r, 0) + 1
-                    rdf = pd.DataFrame({"Role": list(rc.keys()), "Cards": list(rc.values())})
-                    rbar = (alt.Chart(rdf).mark_bar(color="#9a7bc4", cornerRadius=3)
-                            .encode(y=alt.Y("Role:N", sort="-x", title=None),
-                                    x=alt.X("Cards:Q", title="Cards"),
-                                    tooltip=["Role", "Cards"]).properties(height=240))
-                    st.altair_chart(rbar, use_container_width=True)
+                        for s in re.findall(r"\{([WUBRG])\}", c.get("mana_cost", "") or ""):
+                            pip[s] += 1
+                    cmap = {"W": "#f3ecd6", "U": "#5294d6", "B": "#9a7bc4", "R": "#d65a48", "G": "#56a96e"}
+                    pdf = pd.DataFrame({"Color": [k for k in pip if pip[k]], "Pips": [pip[k] for k in pip if pip[k]]})
+                    if not pdf.empty:
+                        st.altair_chart((alt.Chart(pdf).mark_arc(innerRadius=45)
+                                         .encode(theta="Pips:Q",
+                                                 color=alt.Color("Color:N", scale=alt.Scale(
+                                                     domain=list(cmap.keys()), range=list(cmap.values())), legend=None),
+                                                 tooltip=["Color", "Pips"]).properties(height=230)),
+                                        use_container_width=True)
+                    else:
+                        st.caption("Colorless deck.")
+                st.markdown("**Role mix**  <span class='cap'>what jobs the cards do</span>", unsafe_allow_html=True)
+                rdf = pd.DataFrame({"Role": list(rc.keys()), "Cards": list(rc.values())})
+                st.altair_chart((alt.Chart(rdf).mark_bar(color="#9a7bc4", cornerRadius=3)
+                                 .encode(y=alt.Y("Role:N", sort="-x", title=None), x=alt.X("Cards:Q"),
+                                         tooltip=["Role", "Cards"]).properties(height=200)), use_container_width=True)
             except Exception:
                 with ch1:
                     st.markdown("**Mana curve**")
-                    curve = pd.Series([min(7, int(c.get("cmc", 0))) for c in used]).value_counts().sort_index()
-                    st.bar_chart(curve, color=ACCENT, height=220)
+                    st.bar_chart(pd.Series([min(7, int(c.get("cmc", 0))) for c in used]).value_counts().sort_index(),
+                                 color=ACCENT, height=220)
                 with ch2:
                     st.markdown("**Role mix**")
-                    rc = {}
-                    for c in used:
-                        r = "Other" if role(c) == "Spell" else role(c)
-                        rc[r] = rc.get(r, 0) + 1
-                    st.bar_chart(pd.Series(rc).sort_values(ascending=False), color="#9a7bc4", height=220)
+                    st.bar_chart(pd.Series(dict(rc)).sort_values(ascending=False), color="#9a7bc4", height=220)
 
-            # ---- visual deck grid ----
+            # ---- gameplay guide ----
+            with st.expander("📖  How to play this deck", expanded=False):
+                st.markdown(f"**Win condition:** {win_condition(used, strategy)}")
+                _seen, _stars = set(), []
+                for c in sorted(used, key=lambda c: -importance(c)):
+                    if c["name"] not in _seen:
+                        _seen.add(c["name"]); _stars.append(c)
+                    if len(_stars) >= 4:
+                        break
+                st.markdown("**Key cards & synergies:** Your highest-impact pieces are "
+                            + ", ".join(c["name"] for c in _stars)
+                            + ". Build your turns around resolving and protecting these.")
+                mull = {"Aggro": "Keep hands with 2-3 lands and at least two cheap threats. Mulligan slow, land-light, or no-pressure hands.",
+                        "Midrange": "Keep 3-4 lands with a mix of early plays and a payoff. Mulligan one-landers and hands with no early interaction.",
+                        "Control": "Keep 3-5 lands with early removal or card draw. Mulligan hands with no early answers.",
+                        "Combo": "Keep hands that progress toward your engine with some protection. Mulligan hands with no combo pieces or no mana."}[strategy]
+                st.markdown(f"**Mulligan:** {mull}")
+                plans = {"Aggro": ("Deploy threats every turn and attack.", "Push damage, use removal only to clear blockers.", "Burn or swing for lethal; empty your hand."),
+                         "Midrange": ("Develop mana and trade with early threats.", "Deploy your best threats and grind card advantage.", "Close with your strongest cards once ahead."),
+                         "Control": ("Survive: remove early threats, hit land drops.", "Trade one-for-one and start drawing extra cards.", "Land a finisher and protect it to close."),
+                         "Combo": ("Set up mana and dig for pieces.", "Assemble and protect the engine.", "Execute the combo for the win.")}[strategy]
+                st.markdown(f"**Early game:** {plans[0]}")
+                st.markdown(f"**Mid game:** {plans[1]}")
+                st.markdown(f"**Late game:** {plans[2]}")
+
+            # ---- downloads ----
+            brief_line = f"A {purpose.lower()} {strategy.lower()} {fmt} deck in {guild_name(cols)}."
+            dl1, dl2 = st.columns(2)
+            dl1.download_button("⬇  Decklist (CSV)", decklist_csv(used, lands, cols),
+                                file_name=f"{name.replace(' ', '_')}.csv", mime="text/csv", use_container_width=True)
+            dl2.download_button("⬇  Analysis report (TXT)",
+                                deck_report_txt(name, brief_line, q, used, lands, value, cols, strategy, deck_size),
+                                file_name=f"{name.replace(' ', '_')}_report.txt", mime="text/plain", use_container_width=True)
+
+            # ---- visual deck grid (tap to inspect; basket persists) ----
             st.markdown("**The deck**  <span class='cap'>tap any card to inspect it</span>", unsafe_allow_html=True)
-            SS["last_deck"] = used
             by_role = {}
             for c in used:
                 r = "Other" if role(c) == "Spell" else role(c)
                 by_role.setdefault(r, []).append(c)
             order = ["Threat", "Removal", "Counter", "Card Advantage", "Disruption", "Ramp", "Engine", "Other"]
             for r in [x for x in order if x in by_role]:
-                st.markdown(f"**{r} · {len(by_role[r])}**")
-                card_tiles(sorted(by_role[r], key=lambda c: -importance(c)), f"deck_{r}", 6, 60)
+                from collections import Counter as _C
+                cnt = _C(c["name"] for c in by_role[r])
+                uniq, seen = [], set()
+                for c in sorted(by_role[r], key=lambda c: -importance(c)):
+                    if c["name"] not in seen:
+                        seen.add(c["name"]); uniq.append(c)
+                st.markdown(f"**{r} · {len(by_role[r])}**  "
+                            f"<span class='cap'>{len(uniq)} unique</span>", unsafe_allow_html=True)
+                card_tiles(uniq, f"deck_{r}", 6, 60)
             st.markdown(f"**Lands · {lands}**  <span class='cap'>tuned to your colors ({''.join(cols) or 'C'})</span>",
                         unsafe_allow_html=True)
-            stars = ", ".join(c["name"] for c in sorted(used, key=lambda c: -importance(c))[:3])
-            st.success(f"Plays as a {arch.lower()} deck. Standouts: {stars}.")
 
 
 # ============================================================================
