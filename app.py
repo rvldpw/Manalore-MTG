@@ -238,6 +238,18 @@ def price_now(c):
     return _num(p.get("usd")) or _num(p.get("usd_foil")) or (eur * 1.08 if eur else None)
 
 
+def price_info(c):
+    """Return (value, source_label). Honest about whether it's normal, foil, or converted."""
+    p = c.get("prices", {}) or {}
+    if _num(p.get("usd")):
+        return _num(p.get("usd")), "market"
+    if _num(p.get("usd_foil")):
+        return _num(p.get("usd_foil")), "foil only"
+    if _num(p.get("eur")):
+        return _num(p.get("eur")) * 1.08, "converted from EUR"
+    return None, "unavailable"
+
+
 def legal_formats(c):
     L = c.get("legalities", {})
     return [f for f in FMTS if L.get(f) == "legal"]
@@ -245,8 +257,10 @@ def legal_formats(c):
 
 def fmt_usd(v):
     if v is None:
-        return "-"
-    return f"${v:.2f}" if v < 10 else f"${round(v):,}"
+        return "n/a"
+    if v < 100:
+        return f"${v:,.2f}"
+    return f"${round(v):,}"
 
 
 # ---- card attribute helpers (for filtering / origin) ----
@@ -351,12 +365,16 @@ def demand(c):
 
 
 def drift_mo(c):
-    return (demand(c) / 100 - 0.5) * 0.060 - (reprint_risk(c) / 10) * 0.020
+    raw = (demand(c) / 100 - 0.5) * 0.060 - (reprint_risk(c) / 10) * 0.020
+    return clamp(raw, -0.04, 0.05)
 
 
 def proj_price(c):
     p = price_now(c)
-    return None if p is None else p * (1 + 3 * drift_mo(c))
+    if p is None:
+        return None
+    projected = p * (1 + 3 * drift_mo(c))
+    return max(0.01, round(projected, 2))
 
 
 def delta_pct(c):
@@ -887,8 +905,15 @@ def card_sheet_body(c):
         a.metric("Power", importance(c))
         b.metric("Demand", demand(c))
         pj, p = proj_price(c), price_now(c)
+        pval, psrc = price_info(c)
         delt = (pj / p * 100 - 100) if (pj and p) else 0
-        d.metric("Price", fmt_usd(p), f"{delt:+.1f}% 90d" if p else None)
+        d.metric("Price", fmt_usd(p) if p else "n/a", f"{delt:+.1f}% 90d" if p else None)
+        if p and psrc != "market":
+            st.markdown(f"<span class='cap'>Price shown is {psrc}; a standard market price is not listed.</span>",
+                        unsafe_allow_html=True)
+        elif not p:
+            st.markdown("<span class='cap'>No market price is listed for this card yet.</span>",
+                        unsafe_allow_html=True)
         st.markdown("**Signal strength**  <span class='cap'>what drives its power score, each out of 10</span>",
                     unsafe_allow_html=True)
         st.markdown(signal_bars_svg(feats(c)), unsafe_allow_html=True)
@@ -1334,7 +1359,9 @@ with tab_build:
             st.warning("We could not find cards for that brief. Try widening colors or strategy.")
         else:
             name = deck_name(cols, strategy)
-            value = sum(price_now(c) or 0 for c in used)
+            priced_cards = [c for c in used if price_now(c)]
+            value = sum(price_now(c) for c in priced_cards)
+            unpriced = len(used) - len(priced_cards)
             # brief match score: roles covered + color fit + format
             from collections import Counter
             rc = Counter(("Other" if role(c) == "Spell" else role(c)) for c in used)
@@ -1369,6 +1396,9 @@ with tab_build:
             mm2.metric("Est. value", f"${value:.0f}", budget_label(value))
             mm3.metric("Colors", guild_name(cols))
             mm4.metric("Win speed", {"Aggro": "Fast", "Midrange": "Medium", "Control": "Slow", "Combo": "Explosive"}[strategy])
+            if unpriced:
+                st.markdown(f"<span class='cap'>Value covers the {len(priced_cards)} cards with a listed price; "
+                            f"{unpriced} had no price and lands are not counted.</span>", unsafe_allow_html=True)
 
             # ---- validation ----
             st.markdown("#### Validation  <span class='cap'>does the deck match your brief?</span>", unsafe_allow_html=True)
