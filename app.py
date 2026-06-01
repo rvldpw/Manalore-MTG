@@ -735,6 +735,13 @@ st.markdown("""
 /* collapse Streamlit chrome for more usable space */
 #MainMenu{visibility:hidden}
 header[data-testid="stHeader"]{height:0;background:transparent}
+[data-testid="stToolbar"]{display:none!important}
+[data-testid="stToolbarActions"]{display:none!important}
+[data-testid="stActionButtonIcon"]{display:none!important}
+[data-testid="stDecoration"]{display:none!important}
+[data-testid="stAppDeployButton"]{display:none!important}
+.stAppDeployButton{display:none!important}
+.stActionButton{display:none!important}
 footer{visibility:hidden}
 .block-container{padding-top:1.2rem;padding-bottom:2rem;max-width:1400px}
 h1,h2,h3{font-family:'Cinzel',serif!important;color:#f0d292!important;letter-spacing:1.5px}
