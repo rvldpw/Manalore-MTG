@@ -1034,9 +1034,12 @@ def card_tiles(cards, where, cols_n=5, limit=40):
 # LIBRARY
 # ============================================================================
 with tab_lib:
-    st.markdown("<div class='hero'><h2>Read any card like a master.</h2>"
-                "<p>Thousands of the most-played cards, each scored for power, demand and price outlook, "
-                "in plain language for newcomers and full depth for veterans.</p></div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='hero'><h2>Master every card instantly.</h2>"
+        "<p>Thousands of top-played cards, scored for power, demand, and price outlook—"
+        "simple for beginners, deep for veterans.</p></div>",
+        unsafe_allow_html=True
+    )
 
     avg_dem = int(np.mean([demand(c) for c in POOL]))
     priced_pool = [c for c in POOL if price_now(c)]
