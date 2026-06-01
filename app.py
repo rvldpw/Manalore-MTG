@@ -781,7 +781,12 @@ hr{border-color:#27313d}
 div[data-testid="stVerticalBlock"]{gap:.45rem}
 /* metric cards look like a dashboard */
 [data-testid="stMetric"]{background:linear-gradient(180deg,#141a21,#10151c);border:1px solid #27313d;
-  border-radius:13px;padding:12px 14px}
+  border-radius:13px;padding:12px 14px;height:100%;display:flex;flex-direction:column;justify-content:flex-start}
+/* keep every card in a row the same height even when one has a delta badge */
+div[data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]) > div[data-testid="stColumn"]{display:flex}
+div[data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]) > div[data-testid="stColumn"] > div[data-testid="stVerticalBlock"]{width:100%}
+[data-testid="stMetricValue"]{font-size:1.7rem}
+[data-testid="stMetricDelta"]{margin-top:2px}
 [data-testid="stMetricLabel"]{font-family:'IBM Plex Mono';font-size:10px;letter-spacing:1px;text-transform:uppercase;color:#8c97a5}
 /* dataframe a touch denser */
 [data-testid="stDataFrame"]{border:1px solid #27313d;border-radius:12px}
@@ -924,9 +929,24 @@ def card_sheet_body(c):
     if p:
         st.markdown("**Price outlook · next 90 days**  "
                     f"<span class='cap'>model projection, {confidence(c)}% confidence</span>", unsafe_allow_html=True)
-        series = [round(p * (1 + m * drift_mo(c)), 2) for m in range(4)]
-        out = pd.DataFrame({"Projected USD": series}, index=["Now", "+30d", "+60d", "+90d"])
-        st.line_chart(out, color="#5fc28a", height=190)
+        days = [0, 30, 60, 90]
+        series = [round(p * (1 + (d / 30) * drift_mo(c)), 2) for d in days]
+        out = pd.DataFrame({"Day": days, "Label": ["Now", "+30d", "+60d", "+90d"], "Price": series})
+        try:
+            import altair as alt
+            lo, hi = min(series), max(series)
+            pad = max(0.05, (hi - lo) * 0.4)
+            line = (alt.Chart(out).mark_line(color="#5fc28a", strokeWidth=2.5, point=alt.OverlayMarkDef(color="#5fc28a"))
+                    .encode(
+                        x=alt.X("Day:Q", title=None, sort=None,
+                                scale=alt.Scale(domain=[0, 90]),
+                                axis=alt.Axis(values=days, labelExpr="datum.value == 0 ? 'Now' : '+' + datum.value + 'd'")),
+                        y=alt.Y("Price:Q", title="USD", scale=alt.Scale(domain=[max(0, lo - pad), hi + pad])),
+                        tooltip=[alt.Tooltip("Label:N", title="When"), alt.Tooltip("Price:Q", format="$.2f")])
+                    .properties(height=200))
+            st.altair_chart(line, use_container_width=True)
+        except Exception:
+            st.line_chart(out.set_index("Label")["Price"], color="#5fc28a", height=190)
         st.caption(f"Supply risk {reprint_risk(c)}/10. The outlook excludes surprise reprints and rules changes.")
     st.markdown("**Analyst read**")
     label = {"strong": "🟢", "caution": "🔴", "note": "🟡"}
@@ -999,11 +1019,15 @@ with tab_lib:
                 "in plain language for newcomers and full depth for veterans.</p></div>", unsafe_allow_html=True)
 
     avg_dem = int(np.mean([demand(c) for c in POOL]))
-    gain = max(POOL, key=delta_pct)
+    priced_pool = [c for c in POOL if price_now(c)]
+    gain = max(priced_pool, key=delta_pct) if priced_pool else POOL[0]
+    gname = gain["name"].split(",")[0].split(" // ")[0]
+    if len(gname) > 14:
+        gname = gname[:13] + "…"
     reserved = sum(1 for c in POOL if c.get("reserved"))
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Avg Demand", avg_dem)
-    m2.metric("Top Gainer", gain["name"].split(",")[0], f"{delta_pct(gain):+.1f}%")
+    m2.metric("Top Gainer", gname, f"{delta_pct(gain):+.1f}% 90d")
     m3.metric("Supply-Locked", reserved)
     m4.metric("Cards Tracked", f"{len(POOL):,}")
 
