@@ -774,6 +774,27 @@ div[data-testid="stVerticalBlock"]{gap:.45rem}
 .legendrow{font-family:'IBM Plex Mono';font-size:11px;color:#8c97a5;margin:2px 0 10px;display:flex;gap:16px;flex-wrap:wrap}
 .legendrow b{color:#ece6d6;font-weight:500}
 .swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:middle}
+/* ---------- mobile (phones like iPhone SE, <= 640px) ---------- */
+@media (max-width: 640px){
+  .block-container{padding-left:.7rem!important;padding-right:.7rem!important}
+  h1{font-size:1.9rem!important}
+  h2{font-size:1.4rem!important}
+  h3{font-size:1.15rem!important}
+  /* most multi-column rows stack vertically so nothing becomes a sliver */
+  div[data-testid="stHorizontalBlock"]{flex-wrap:wrap!important;gap:8px!important}
+  div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]{
+    flex:1 1 100%!important;width:100%!important;min-width:100%!important}
+  /* card grids stay 2-up instead of 1-up so browsing is not endless scroll */
+  div[data-testid="stColumn"]:has(img.cardart){flex:1 1 47%!important;min-width:47%!important;width:47%!important}
+  [data-testid="stMetric"]{padding:9px 11px}
+  [data-testid="stMetricValue"]{font-size:1.25rem!important}
+  .tname{height:auto;font-size:12px}
+  .stTabs [data-baseweb="tab"]{font-size:10.5px;padding:0 6px}
+  .verdict{font-size:13.5px}
+  .signalwrap svg{max-width:100%!important}
+}
+/* make the chart container never overflow horizontally */
+[data-testid="stArrowVegaLiteChart"], .stVegaLiteChart{overflow-x:auto}
 </style>
 """, unsafe_allow_html=True)
 
@@ -823,20 +844,22 @@ tab_lib, tab_look, tab_sets, tab_build, tab_market, tab_academy = st.tabs(
 
 # ---- shared card sheet ----
 def signal_bars_svg(f):
-    """A compact, labeled horizontal bar readout (0-10) that anyone can read."""
+    """A compact, labeled bar readout (0-10) that scales to any width."""
     rows = [("Play-rate", f["play_rank"], "#d9a850"), ("Efficiency", f["eff"], "#5fc28a"),
             ("Card advantage", f["card_adv"], "#5294d6"), ("Flexibility", f["flex"], "#9a7bc4"),
             ("Format breadth", f["ubiq"], "#e0a64b"), ("Keywords", f["kw"], "#df7261")]
-    h = len(rows) * 30 + 10
-    parts = [f"<svg viewBox='0 0 320 {h}' width='100%' style='max-width:420px'>"]
+    h = len(rows) * 30 + 8
+    W, lab_w, val_w = 400, 120, 30
+    bar_max = W - lab_w - val_w - 8
+    parts = [f"<div class='signalwrap'><svg viewBox='0 0 {W} {h}' width='100%' preserveAspectRatio='xMinYMin meet'>"]
     for i, (lab, val, col) in enumerate(rows):
-        y = 12 + i * 30
-        w = max(2, val / 10 * 150)
-        parts.append(f"<text x='0' y='{y+11}' fill='#b9c2cf' font-family=\"IBM Plex Mono\" font-size='11'>{lab}</text>")
-        parts.append(f"<rect x='130' y='{y}' width='150' height='14' rx='4' fill='#1a2128'/>")
-        parts.append(f"<rect x='130' y='{y}' width='{w:.0f}' height='14' rx='4' fill='{col}'/>")
-        parts.append(f"<text x='288' y='{y+11}' fill='{col}' font-family=\"IBM Plex Mono\" font-size='11'>{val:.1f}</text>")
-    parts.append("</svg>")
+        y = 10 + i * 30
+        w = max(2, val / 10 * bar_max)
+        parts.append(f"<text x='0' y='{y+11}' fill='#b9c2cf' font-family=\"IBM Plex Mono\" font-size='12'>{lab}</text>")
+        parts.append(f"<rect x='{lab_w}' y='{y}' width='{bar_max}' height='14' rx='4' fill='#1a2128'/>")
+        parts.append(f"<rect x='{lab_w}' y='{y}' width='{w:.0f}' height='14' rx='4' fill='{col}'/>")
+        parts.append(f"<text x='{W-2}' y='{y+11}' text-anchor='end' fill='{col}' font-family=\"IBM Plex Mono\" font-size='12'>{val:.1f}</text>")
+    parts.append("</svg></div>")
     return "".join(parts)
 
 
@@ -1361,12 +1384,16 @@ with tab_build:
                     cv = {}
                     for c in used:
                         k = min(7, int(c.get("cmc", 0))); cv[k] = cv.get(k, 0) + 1
-                    cvdf = pd.DataFrame({"Mana value": [(f"{k}" if k < 7 else "7+") for k in range(8)],
-                                         "Cards": [cv.get(k, 0) for k in range(8)]})
-                    st.altair_chart((alt.Chart(cvdf).mark_bar(color=ACCENT, cornerRadius=3)
-                                     .encode(x=alt.X("Mana value:N", sort=None), y=alt.Y("Cards:Q"),
-                                             tooltip=["Mana value", "Cards"]).properties(height=230)),
-                                    use_container_width=True)
+                    mv_order = [(f"{k}" if k < 7 else "7+") for k in range(8)]
+                    cvdf = pd.DataFrame({"Mana value": mv_order, "Cards": [cv.get(k, 0) for k in range(8)]})
+                    base = alt.Chart(cvdf).encode(
+                        x=alt.X("Mana value:N", sort=mv_order, title="Mana value",
+                                axis=alt.Axis(labelAngle=0)),
+                        y=alt.Y("Cards:Q", title="Cards"))
+                    bars = base.mark_bar(color=ACCENT, cornerRadius=3).encode(tooltip=["Mana value", "Cards"])
+                    labels = base.mark_text(dy=-6, color="#ece6d6", fontSize=11).encode(
+                        text=alt.condition("datum.Cards > 0", "Cards:Q", alt.value("")))
+                    st.altair_chart((bars + labels).properties(height=230), use_container_width=True)
                 with ch2:
                     st.markdown("**Color split**  <span class='cap'>mana symbols in the deck</span>", unsafe_allow_html=True)
                     pip = {"W": 0, "U": 0, "B": 0, "R": 0, "G": 0}
@@ -1386,9 +1413,10 @@ with tab_build:
                         st.caption("Colorless deck.")
                 st.markdown("**Role mix**  <span class='cap'>what jobs the cards do</span>", unsafe_allow_html=True)
                 rdf = pd.DataFrame({"Role": list(rc.keys()), "Cards": list(rc.values())})
-                st.altair_chart((alt.Chart(rdf).mark_bar(color="#9a7bc4", cornerRadius=3)
-                                 .encode(y=alt.Y("Role:N", sort="-x", title=None), x=alt.X("Cards:Q"),
-                                         tooltip=["Role", "Cards"]).properties(height=200)), use_container_width=True)
+                rbase = alt.Chart(rdf).encode(y=alt.Y("Role:N", sort="-x", title=None), x=alt.X("Cards:Q", title="Cards"))
+                rbars = rbase.mark_bar(color="#9a7bc4", cornerRadius=3).encode(tooltip=["Role", "Cards"])
+                rlabels = rbase.mark_text(dx=8, color="#ece6d6", fontSize=11).encode(text="Cards:Q")
+                st.altair_chart((rbars + rlabels).properties(height=220), use_container_width=True)
             except Exception:
                 with ch1:
                     st.markdown("**Mana curve**")
@@ -1489,26 +1517,69 @@ with tab_market:
 
     st.divider()
     st.markdown("#### Demand vs price")
-    st.markdown("<div class='legendrow'>Each dot is a card. "
-                "<span><span class='swatch' style='background:#5fc28a'></span>rising</span>"
-                "<span><span class='swatch' style='background:#df7261'></span>falling</span> "
-                "Up and to the right means high demand meeting high price.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='legendrow'>Each dot is a card. Bigger dot means higher power. "
+                "<span><span class='swatch' style='background:#5fc28a'></span>projected to rise</span>"
+                "<span><span class='swatch' style='background:#df7261'></span>projected to fall</span> "
+                "Right means more in demand; higher means pricier.</div>", unsafe_allow_html=True)
     try:
         import altair as alt
-        sc = df.copy()
+        sc = df[df["Price"] > 0].copy()
         sc["Trend"] = np.where(sc["Move %"] >= 0, "Rising", "Falling")
-        chart = (alt.Chart(sc).mark_circle(opacity=0.7)
+        chart = (alt.Chart(sc).mark_circle(opacity=0.65)
                  .encode(
-                     x=alt.X("Demand:Q", title="Demand index"),
-                     y=alt.Y("Price:Q", title="Market price (USD)", scale=alt.Scale(type="symlog")),
-                     size=alt.Size("Power:Q", scale=alt.Scale(range=[20, 320]), title="Power"),
+                     x=alt.X("Demand:Q", title="Demand index (higher = more played)",
+                             scale=alt.Scale(domain=[0, 100]), axis=alt.Axis(grid=True)),
+                     y=alt.Y("Price:Q", title="Market price, USD (log scale)",
+                             scale=alt.Scale(type="log"), axis=alt.Axis(grid=True)),
+                     size=alt.Size("Power:Q", scale=alt.Scale(range=[25, 360]), title="Power"),
                      color=alt.Color("Trend:N", scale=alt.Scale(domain=["Rising", "Falling"],
                                                                 range=["#5fc28a", "#df7261"]), legend=None),
-                     tooltip=["Card", "Power", "Demand", "Price", "Move %"])
-                 .properties(height=320).interactive())
+                     tooltip=["Card", "Power", "Demand", alt.Tooltip("Price:Q", format="$.2f"), "Move %"])
+                 .properties(height=340))
         st.altair_chart(chart, use_container_width=True)
+        st.caption("A log price scale spreads cheap and expensive cards evenly so the pattern is readable.")
     except Exception:
-        st.scatter_chart(df, x="Demand", y="Price", height=300)
+        st.scatter_chart(df, x="Demand", y="Price", height=320)
+
+    # ---- two more charts for richer info ----
+    st.divider()
+    ec1, ec2 = st.columns(2)
+    try:
+        import altair as alt
+        with ec1:
+            st.markdown("**Price distribution**  <span class='cap'>how many cards in each price band</span>",
+                        unsafe_allow_html=True)
+            def band(p):
+                return ("Under $1" if p < 1 else "$1-5" if p < 5 else "$5-20" if p < 20
+                        else "$20-100" if p < 100 else "Over $100")
+            order = ["Under $1", "$1-5", "$5-20", "$20-100", "Over $100"]
+            bd_counts = {b: 0 for b in order}
+            for c in priced:
+                bd_counts[band(price_now(c))] += 1
+            bdf = pd.DataFrame({"Band": order, "Cards": [bd_counts[b] for b in order]})
+            bbase = alt.Chart(bdf).encode(x=alt.X("Band:N", sort=order, title=None, axis=alt.Axis(labelAngle=0)),
+                                          y=alt.Y("Cards:Q", title="Cards"))
+            st.altair_chart((bbase.mark_bar(color="#5294d6", cornerRadius=3).encode(tooltip=["Band", "Cards"])
+                             + bbase.mark_text(dy=-6, color="#ece6d6", fontSize=11).encode(
+                                 text=alt.condition("datum.Cards > 0", "Cards:Q", alt.value("")))
+                             ).properties(height=260), use_container_width=True)
+        with ec2:
+            st.markdown("**Average price by role**  <span class='cap'>which card jobs cost the most</span>",
+                        unsafe_allow_html=True)
+            role_prices = {}
+            for c in priced:
+                role_prices.setdefault(role(c), []).append(price_now(c))
+            rpdf = pd.DataFrame({"Role": list(role_prices.keys()),
+                                 "Avg price": [round(np.mean(v), 2) for v in role_prices.values()]})
+            rpbase = alt.Chart(rpdf).encode(y=alt.Y("Role:N", sort="-x", title=None),
+                                            x=alt.X("Avg price:Q", title="Average price (USD)"))
+            st.altair_chart((rpbase.mark_bar(color="#d9a850", cornerRadius=3).encode(
+                                tooltip=["Role", alt.Tooltip("Avg price:Q", format="$.2f")])
+                             + rpbase.mark_text(dx=8, color="#ece6d6", fontSize=11).encode(
+                                 text=alt.Tooltip("Avg price:Q", format="$.0f"))
+                             ).properties(height=260), use_container_width=True)
+    except Exception:
+        pass
 
     st.divider()
     st.markdown("#### Biggest movers · next 90 days")
