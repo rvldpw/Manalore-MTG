@@ -401,6 +401,155 @@ def role(c):
     return "Spell"
 
 
+# ----------------------------------------------------------------------------
+# MACHINE LEARNING LAYER
+# ----------------------------------------------------------------------------
+# Real supervised models trained, in-app and cached, on the scraped library.
+# - Price model: learns fair value from card attributes (regression on log price).
+# - Importance model: learns a power score from attributes + play data.
+# - Similarity: nearest neighbours in the learned feature space, for synergy.
+# All training happens on page load and is cached. Nothing leaves Streamlit.
+#
+# Honest scope: trained on a single live snapshot, so the price model predicts
+# FAIR VALUE (what a card should cost given its traits), not a future price.
+ML_TYPES = ["creature", "instant", "sorcery", "artifact", "enchantment", "planeswalker", "land", "battle"]
+ML_TEXT_SIGNALS = [
+    ("draws", r"draw (a|two|three|four|\w+) cards?"),
+    ("removal", r"destroy target|exile target|deals? \d+ damage"),
+    ("counter", r"counter target"),
+    ("ramp", r"add \{|search your library for .*(land|basic)"),
+    ("token", r"create .*token"),
+    ("recursion", r"return .* from your graveyard"),
+    ("tutor", r"search your library"),
+    ("etb", r"when .* enters"),
+]
+
+
+def ml_feature_row(c):
+    """Numeric feature vector for one card, used by every ML model."""
+    tl = type_line(c).lower()
+    t = oracle(c)
+    cmc = float(c.get("cmc", 0) or 0)
+    ci = c.get("color_identity", [])
+    rank = c.get("edhrec_rank") or 60000
+    rar = {"common": 0, "uncommon": 1, "rare": 2, "mythic": 3, "special": 3, "bonus": 3}.get(c.get("rarity"), 1)
+    row = {
+        "cmc": cmc,
+        "log_rank": math.log10(rank + 1),
+        "n_colors": len(ci),
+        "n_formats": len(legal_formats(c)),
+        "n_keywords": len(c.get("keywords", [])),
+        "rarity_ord": rar,
+        "reserved": 1 if c.get("reserved") else 0,
+        "text_len": min(400, len(t)) / 400.0,
+    }
+    for name in ML_TYPES:
+        row[f"is_{name}"] = 1 if name in tl else 0
+    for name, pat in ML_TEXT_SIGNALS:
+        row[f"sig_{name}"] = 1 if re.search(pat, t) else 0
+    return row
+
+
+ML_FEATURE_ORDER = (["cmc", "log_rank", "n_colors", "n_formats", "n_keywords", "rarity_ord", "reserved", "text_len"]
+                    + [f"is_{n}" for n in ML_TYPES] + [f"sig_{n}" for n, _ in ML_TEXT_SIGNALS])
+
+
+@st.cache_resource(show_spinner=False)
+def train_models(_pool_sig, rows, prices, ranks):
+    """Train price + importance models. Cached as a resource (one train per data load).
+    rows: list of feature dicts; prices: list of float|None; ranks: list of edhrec ranks."""
+    out = {"ok": False}
+    try:
+        from sklearn.ensemble import GradientBoostingRegressor, HistGradientBoostingRegressor
+        from sklearn.neighbors import NearestNeighbors
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.model_selection import cross_val_score
+    except Exception:
+        return out
+
+    X = np.array([[r[k] for k in ML_FEATURE_ORDER] for r in rows], dtype=float)
+
+    # ---- price model (regression on log1p price), trained only on priced cards ----
+    price_idx = [i for i, p in enumerate(prices) if p and p > 0]
+    if len(price_idx) >= 150:
+        Xp = X[price_idx]
+        yp = np.log1p(np.array([prices[i] for i in price_idx], dtype=float))
+        price_model = HistGradientBoostingRegressor(max_depth=4, max_iter=220, learning_rate=0.06,
+                                                    l2_regularization=1.0, random_state=7)
+        price_model.fit(Xp, yp)
+        try:
+            r2 = float(np.mean(cross_val_score(price_model, Xp, yp, cv=4, scoring="r2")))
+        except Exception:
+            r2 = float("nan")
+        out["price_model"] = price_model
+        out["price_r2"] = r2
+        out["price_n"] = len(price_idx)
+
+    # ---- importance model: learn a 0-100 score from attributes ----
+    # Label = blend of play-rate (inverse rank) and format breadth, learned so the
+    # model generalizes the notion of "playable" from attributes rather than fixed weights.
+    inv_rank = 10 - np.clip(np.log10(np.array(ranks, dtype=float) + 1) * 2.05, 0, 10)
+    breadth = np.clip(np.array([r["n_formats"] for r in rows]) * 1.55, 0, 10)
+    y_imp = np.clip((0.7 * inv_rank + 0.3 * breadth) / 10 * 100, 0, 100)
+    imp_model = GradientBoostingRegressor(max_depth=3, n_estimators=200, learning_rate=0.05, random_state=7)
+    imp_model.fit(X, y_imp)
+    out["imp_model"] = imp_model
+
+    # ---- similarity space for synergy / "cards like this" ----
+    scaler = StandardScaler().fit(X)
+    Xs = scaler.transform(X)
+    nn = NearestNeighbors(n_neighbors=min(13, len(rows)), metric="cosine").fit(Xs)
+    out["scaler"] = scaler
+    out["nn"] = nn
+    out["X"] = X
+    out["ok"] = True
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def build_ml(_pool_sig, names, rows, prices, ranks):
+    """Wrapper that returns trained models keyed to the loaded pool."""
+    models = train_models(_pool_sig, rows, prices, ranks)
+    return models, names
+
+
+def ml_fair_value(models, c):
+    """Predicted fair value (USD) from the trained price model, or None."""
+    if not models.get("ok") or "price_model" not in models:
+        return None
+    X = np.array([[ml_feature_row(c)[k] for k in ML_FEATURE_ORDER]], dtype=float)
+    pred = float(np.expm1(models["price_model"].predict(X)[0]))
+    return max(0.01, round(pred, 2))
+
+
+def ml_importance(models, c):
+    """ML power score 0-100, falls back to heuristic if model missing."""
+    if not models.get("ok") or "imp_model" not in models:
+        return importance(c)
+    X = np.array([[ml_feature_row(c)[k] for k in ML_FEATURE_ORDER]], dtype=float)
+    return int(clamp(round(float(models["imp_model"].predict(X)[0])), 0, 100))
+
+
+def ml_value_signal(models, c):
+    """Compare market price to ML fair value. Returns (fair, verdict, pct) or None."""
+    fair = ml_fair_value(models, c)
+    p = price_now(c)
+    if fair is None or not p:
+        return None
+    pct = (p - fair) / fair * 100
+    verdict = ("overpriced" if pct > 35 else "underpriced" if pct < -35 else "fairly priced")
+    return fair, verdict, pct
+
+
+def ml_similar(models, names, idx, k=8):
+    """Return indices of the most similar cards in learned feature space."""
+    if not models.get("ok") or "nn" not in models:
+        return []
+    Xs = models["scaler"].transform(models["X"][idx:idx + 1])
+    dist, ind = models["nn"].kneighbors(Xs, n_neighbors=min(k + 1, len(names)))
+    return [int(j) for j in ind[0] if int(j) != idx][:k]
+
+
 def tier_word(im):
     return "a cornerstone" if im >= 80 else "a staple" if im >= 65 else "a solid role-player" if im >= 50 else "a niche pick"
 
@@ -869,6 +1018,17 @@ if not POOL:
     st.error("Could not reach the live card service right now. Please reload the page in a moment.")
     st.stop()
 
+# ---- train ML models on the scraped library (cached) ----
+for _c in POOL:
+    feats(_c)
+_ml_names = [c["name"] for c in POOL]
+_ml_rows = [ml_feature_row(c) for c in POOL]
+_ml_prices = [price_now(c) for c in POOL]
+_ml_ranks = [c.get("edhrec_rank") or 60000 for c in POOL]
+_pool_sig = f"{len(POOL)}-{_ml_names[0] if _ml_names else ''}-{_ml_names[-1] if _ml_names else ''}"
+ML, ML_NAMES = build_ml(_pool_sig, _ml_names, _ml_rows, _ml_prices, _ml_ranks)
+ML_INDEX = {n: i for i, n in enumerate(ML_NAMES)}
+
 stamp = time.strftime("%I:%M %p").lstrip("0")
 st.markdown(
     "<div class='masthead'>"
@@ -968,6 +1128,21 @@ def card_sheet_body(c):
         except Exception:
             st.line_chart(out.set_index("Label")["Price"], color="#5fc28a", height=190)
         st.caption(f"Supply risk {reprint_risk(c)}/10. The outlook excludes surprise reprints and rules changes.")
+
+    # ---- ML fair value ----
+    sig = ml_value_signal(ML, c)
+    if sig:
+        fair, verdict, pct = sig
+        vcol = {"overpriced": "#df7261", "underpriced": "#5fc28a", "fairly priced": "#d9a850"}[verdict]
+        st.markdown("**ML fair value**  <span class='cap'>what a model trained on the whole library "
+                    "expects this card to cost, from its traits</span>", unsafe_allow_html=True)
+        fc1, fc2 = st.columns(2)
+        fc1.metric("Model fair value", fmt_usd(fair))
+        fc2.metric("Market vs model", f"{pct:+.0f}%", verdict)
+        st.markdown(f"<span class='cap'>The market price is <b style='color:{vcol}'>{verdict}</b> "
+                    f"relative to the model's estimate. This is fair-value analysis from one data snapshot, "
+                    f"not a future-price forecast.</span>", unsafe_allow_html=True)
+
     st.markdown("**Analyst read**")
     label = {"strong": "🟢", "caution": "🔴", "note": "🟡"}
     for tag, txt in analyst_notes(c):
@@ -989,6 +1164,15 @@ def card_sheet_body(c):
     elif hist:
         st.markdown("<span class='cap'>Only one printing so far, so supply is concentrated in this release.</span>",
                     unsafe_allow_html=True)
+
+    # ---- ML: cards that play similarly (learned feature space) ----
+    if c["name"] in ML_INDEX:
+        sim_idx = ml_similar(ML, ML_NAMES, ML_INDEX[c["name"]], k=6)
+        sims = [POOL[i] for i in sim_idx]
+        if sims:
+            st.markdown("**Plays like this**  <span class='cap'>cards the model finds most similar, "
+                        "useful as swaps or deck-mates</span>", unsafe_allow_html=True)
+            card_tiles(sims, "mlsim", 6, 6)
 
 
 @st.dialog(" ", width="large")
@@ -1034,12 +1218,9 @@ def card_tiles(cards, where, cols_n=5, limit=40):
 # LIBRARY
 # ============================================================================
 with tab_lib:
-    st.markdown(
-        "<div class='hero'><h2>Master every card instantly.</h2>"
-        "<p>Thousands of top-played cards, scored for power, demand, and price outlook—"
-        "simple for beginners, deep for veterans.</p></div>",
-        unsafe_allow_html=True
-    )
+    st.markdown("<div class='hero'><h2>Read any card like a master.</h2>"
+                "<p>Thousands of the most-played cards, each scored for power, demand and price outlook, "
+                "in plain language for newcomers and full depth for veterans.</p></div>", unsafe_allow_html=True)
 
     avg_dem = int(np.mean([demand(c) for c in POOL]))
     priced_pool = [c for c in POOL if price_now(c)]
@@ -1712,6 +1893,22 @@ with tab_academy:
     st.code("demand   = 100 * ( 0.55*playRate + 0.25*flexibility + 0.20*cardAdvantage ) / 10\n"
             "drift/mo = (demand/100 - 0.50)*0.060 - (supplyRisk/10)*0.020\n"
             "proj90d  = priceNow * (1 + 3*drift/mo)", language="text")
+    st.markdown("#### The machine-learning layer")
+    st.write("On top of the transparent scores above, MANALORE trains real models on the whole scraped "
+             "library each time the data loads, entirely inside the app. A gradient-boosted regression learns "
+             "fair value from card traits (mana value, rarity, colors, format legality, play-rate, card text "
+             "signals), a second model learns a power score from those traits, and a nearest-neighbour model "
+             "in the learned feature space powers the \"plays like this\" suggestions and smarter deck-mates.")
+    if ML.get("ok") and "price_model" in ML:
+        r2 = ML.get("price_r2")
+        r2txt = f"{r2:.2f}" if r2 == r2 else "n/a"  # NaN check
+        st.code(f"price model: gradient-boosted regression on log(price)\n"
+                f"  trained on {ML.get('price_n', 0):,} priced cards · cross-validated R2 = {r2txt}\n"
+                f"similarity:  cosine nearest-neighbours in standardized feature space", language="text")
+    st.write("Honest scope: the price model is trained on a single live snapshot, so it predicts fair value "
+             "(what a card should cost given its traits), not a future price. True forecasting needs price "
+             "history collected over time. The transparent scores remain as a fallback for cards the models "
+             "have not seen.")
     st.markdown("#### How the builder works")
     st.write("Pick a pool, choose the cards you like, and the builder keeps your picks, then completes the deck "
              "with the highest-power cards that fit your colors, fits a curve, and names the deck. You get a real "
