@@ -178,15 +178,18 @@ def type_line(c):
     return c.get("type_line") or (c.get("card_faces", [{}])[0].get("type_line", "") if c.get("card_faces") else "")
 
 
+def _num(x):
+    try:
+        v = float(x)
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def price_now(c):
     p = c.get("prices", {}) or {}
-    if p.get("usd"):
-        return float(p["usd"])
-    if p.get("usd_foil"):
-        return float(p["usd_foil"])
-    if p.get("eur"):
-        return float(p["eur"]) * 1.08
-    return None
+    eur = _num(p.get("eur"))
+    return _num(p.get("usd")) or _num(p.get("usd_foil")) or (eur * 1.08 if eur else None)
 
 
 def legal_formats(c):
@@ -402,6 +405,30 @@ div[data-testid="stHorizontalBlock"]{gap:14px}
 .muted{color:#8c97a5}
 .note-row{border-left:2px solid #27313d;padding:4px 0 4px 12px;margin:6px 0;font-size:13.5px;line-height:1.5}
 hr{border-color:#27313d}
+/* uniform card art: fixed 4:3 crop so the grid is even, no weird shapes */
+.cardart{width:100%;aspect-ratio:4/3;object-fit:cover;object-position:center 22%;border-radius:10px;
+  border:1px solid #2b3542;display:block}
+.tilewrap{margin-bottom:2px}
+.tilewrap .meta{font-family:'IBM Plex Mono';font-size:11px;margin:5px 0 2px;display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+.tilewrap .tname{font-size:12.5px;line-height:1.25;height:32px;overflow:hidden;margin-top:4px}
+/* shrink the gap Streamlit puts under images and buttons */
+[data-testid="stImage"]{margin-bottom:2px}
+.stButton{margin-top:0}
+.element-container{margin-bottom:.35rem}
+div[data-testid="stVerticalBlock"]{gap:.45rem}
+/* metric cards look like a dashboard */
+[data-testid="stMetric"]{background:linear-gradient(180deg,#141a21,#10151c);border:1px solid #27313d;
+  border-radius:13px;padding:12px 14px}
+[data-testid="stMetricLabel"]{font-family:'IBM Plex Mono';font-size:10px;letter-spacing:1px;text-transform:uppercase;color:#8c97a5}
+/* dataframe a touch denser */
+[data-testid="stDataFrame"]{border:1px solid #27313d;border-radius:12px}
+/* suggestion buttons look like a dropdown list */
+.sugg .stButton button{text-align:left;justify-content:flex-start;width:100%;background:rgba(255,255,255,.015);
+  border:1px solid #222b35;font-family:'Spectral';font-size:14px;padding:9px 12px}
+.sugg .stButton button:hover{background:rgba(217,168,80,.08)}
+.legendrow{font-family:'IBM Plex Mono';font-size:11px;color:#8c97a5;margin:2px 0 10px;display:flex;gap:16px;flex-wrap:wrap}
+.legendrow b{color:#ece6d6;font-weight:500}
+.swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:middle}
 </style>
 """, unsafe_allow_html=True)
 
@@ -449,16 +476,31 @@ tab_lib, tab_look, tab_sets, tab_build, tab_market, tab_academy = st.tabs(
 
 
 # ---- shared card sheet ----
+def signal_bars_svg(f):
+    """A compact, labeled horizontal bar readout (0-10) that anyone can read."""
+    rows = [("Play-rate", f["play_rank"], "#d9a850"), ("Efficiency", f["eff"], "#5fc28a"),
+            ("Card advantage", f["card_adv"], "#5294d6"), ("Flexibility", f["flex"], "#9a7bc4"),
+            ("Format breadth", f["ubiq"], "#e0a64b"), ("Keywords", f["kw"], "#df7261")]
+    h = len(rows) * 30 + 10
+    parts = [f"<svg viewBox='0 0 320 {h}' width='100%' style='max-width:420px'>"]
+    for i, (lab, val, col) in enumerate(rows):
+        y = 12 + i * 30
+        w = max(2, val / 10 * 150)
+        parts.append(f"<text x='0' y='{y+11}' fill='#b9c2cf' font-family=\"IBM Plex Mono\" font-size='11'>{lab}</text>")
+        parts.append(f"<rect x='130' y='{y}' width='150' height='14' rx='4' fill='#1a2128'/>")
+        parts.append(f"<rect x='130' y='{y}' width='{w:.0f}' height='14' rx='4' fill='{col}'/>")
+        parts.append(f"<text x='288' y='{y+11}' fill='{col}' font-family=\"IBM Plex Mono\" font-size='11'>{val:.1f}</text>")
+    parts.append("</svg>")
+    return "".join(parts)
+
+
 def card_sheet_body(c):
-    """The contents of a card popup: image, verdict, metrics, charts, notes."""
-    left, right = st.columns([1, 1.4])
+    """Card popup: image + verdict + metrics on top, then full-width charts. No empty gaps."""
+    left, right = st.columns([1, 1.5], gap="medium")
     with left:
-        im = img_uri(c, "normal")
+        im = img_uri(c, "normal") or img_uri(c, "large")
         if im:
             st.image(im, use_container_width=True)
-        fmts = legal_formats(c)
-        st.markdown("<span class='cap'>LEGAL: " + (", ".join(f.title() for f in fmts) if fmts else "Limited")
-                    + "</span>", unsafe_allow_html=True)
         in_basket = c["name"] in [x["name"] for x in SS["basket"]]
         if st.button("✓ In your deck" if in_basket else "＋ Add to deck builder",
                      key=f"dlgadd_{c.get('id', c['name'])}", use_container_width=True,
@@ -477,20 +519,21 @@ def card_sheet_body(c):
         b.metric("Demand", demand(c))
         pj, p = proj_price(c), price_now(c)
         delt = (pj / p * 100 - 100) if (pj and p) else 0
-        d.metric("Price", fmt_usd(p), f"{delt:+.1f}% 90d")
-        f = feats(c)
-        contrib = pd.DataFrame({
-            "signal": ["Play-rate", "Efficiency", "Card adv", "Breadth", "Flexibility", "Keywords"],
-            "contribution": [round(W_IMP["play_rank"] * f["play_rank"] * 10, 1), round(W_IMP["eff"] * f["eff"] * 10, 1),
-                             round(W_IMP["card_adv"] * f["card_adv"] * 10, 1), round(W_IMP["ubiq"] * f["ubiq"] * 10, 1),
-                             round(W_IMP["flex"] * f["flex"] * 10, 1), round(W_IMP["kw"] * f["kw"] * 10, 1)],
-        }).set_index("signal")
-        st.markdown("**Why it scores this way**")
-        st.bar_chart(contrib, color=ACCENT, height=190, horizontal=True)
-    st.markdown("**Price outlook · next 90 days**")
-    series = [round((p or 0) * (1 + m * drift_mo(c)), 2) for m in range(4)]
-    st.area_chart(pd.DataFrame({"USD": series}, index=["Now", "+30d", "+60d", "+90d"]), color="#5fc28a", height=170)
-    st.caption(f"Confidence {confidence(c)}% · supply risk {reprint_risk(c)}/10. Excludes surprise reprints and rules changes.")
+        d.metric("Price", fmt_usd(p), f"{delt:+.1f}% 90d" if p else None)
+        st.markdown("**Signal strength**  <span class='cap'>what drives its power score, each out of 10</span>",
+                    unsafe_allow_html=True)
+        st.markdown(signal_bars_svg(feats(c)), unsafe_allow_html=True)
+        fmts = legal_formats(c)
+        st.markdown("<span class='cap'>LEGAL: " + (", ".join(f.title() for f in fmts) if fmts else "Limited")
+                    + "</span>", unsafe_allow_html=True)
+
+    if p:
+        st.markdown("**Price outlook · next 90 days**  "
+                    f"<span class='cap'>model projection, {confidence(c)}% confidence</span>", unsafe_allow_html=True)
+        series = [round(p * (1 + m * drift_mo(c)), 2) for m in range(4)]
+        out = pd.DataFrame({"Projected USD": series}, index=["Now", "+30d", "+60d", "+90d"])
+        st.line_chart(out, color="#5fc28a", height=190)
+        st.caption(f"Supply risk {reprint_risk(c)}/10. The outlook excludes surprise reprints and rules changes.")
     st.markdown("**Analyst read**")
     label = {"strong": "🟢", "caution": "🔴", "note": "🟡"}
     for tag, txt in analyst_notes(c):
@@ -508,7 +551,7 @@ def show_card(c):
 
 
 def card_tiles(cards, where, cols_n=5, limit=40):
-    """Visual grid of card art. Clicking a card opens its popup."""
+    """Visual grid of card art with a uniform crop. Clicking opens the popup."""
     cards = cards[:limit]
     rows = (len(cards) + cols_n - 1) // cols_n
     idx = 0
@@ -519,15 +562,20 @@ def card_tiles(cards, where, cols_n=5, limit=40):
                 break
             c = cards[idx]; idx += 1
             with col:
-                art = img_uri(c, "art_crop") or img_uri(c, "normal")
-                if art:
-                    st.image(art, use_container_width=True)
+                art = img_uri(c, "art_crop") or img_uri(c, "normal") or ""
                 d = delta_pct(c)
-                tag = f"<span class='badge {'up' if d>=0 else 'dn'}'>{'▲' if d>=0 else '▼'}{abs(d):.0f}%</span>"
-                st.markdown(f"<div class='nm'>{c['name'][:30]}</div>"
-                            f"<span class='pwr' style='color:{score_color(importance(c))}'>{importance(c)}</span> "
-                            f"<span class='cap'>{fmt_usd(price_now(c))}</span> {tag}", unsafe_allow_html=True)
-                if st.button("View card", key=f"{where}_open_{idx}_{c.get('id', c['name'])}", use_container_width=True):
+                cls = "up" if d >= 0 else "dn"
+                arrow = "▲" if d >= 0 else "▼"
+                st.markdown(
+                    f"<div class='tilewrap'>"
+                    f"<img class='cardart' src='{art}' alt=''>"
+                    f"<div class='meta'>"
+                    f"<span class='pwr' style='color:{score_color(importance(c))}'>{importance(c)}</span>"
+                    f"<span class='gold'>{fmt_usd(price_now(c))}</span>"
+                    f"<span class='badge {cls}'>{arrow}{abs(d):.0f}%</span></div>"
+                    f"<div class='tname'>{c['name']}</div></div>",
+                    unsafe_allow_html=True)
+                if st.button("View", key=f"{where}_open_{idx}_{c.get('id', c['name'])}", use_container_width=True):
                     show_card(c)
 
 
@@ -589,29 +637,32 @@ with tab_lib:
 # ============================================================================
 with tab_look:
     st.markdown("### Find a card")
-    st.markdown("<span class='cap'>Search any card ever printed. Partial names and typos are fine.</span>",
-                unsafe_allow_html=True)
+    st.markdown("<span class='cap'>Start typing. Suggestions appear instantly, like a search engine. "
+                "Partial names and typos are fine.</span>", unsafe_allow_html=True)
 
-    q = st.text_input("Card name", "", placeholder="e.g. spider, bolt, ragavan, miles morales")
+    q = st.text_input("Card name", "", placeholder="e.g. spider, bolt, ragavan, miles morales",
+                      key="look_q")
     if q and len(q) >= 2:
         names = scry_autocomplete(q)
-        if not names:
-            fb = scry_named(q)
-            names = [fb["name"]] if fb and fb.get("name") else []
-        if not names:
-            st.info("No card found for that yet. Check the spelling, or try fewer letters.")
+        if names:
+            st.markdown(f"<span class='cap'>{len(names)} suggestion(s) · tap to open</span>", unsafe_allow_html=True)
+            st.markdown("<div class='sugg'>", unsafe_allow_html=True)
+            for i, n in enumerate(names[:10]):
+                if st.button(f"🔍  {n}", key=f"sugg_{i}", use_container_width=True):
+                    fb = scry_named(n)
+                    if fb:
+                        show_card(fb)
+            st.markdown("</div>", unsafe_allow_html=True)
         else:
-            cards = [c for c in scry_collection(names[:12]) if c.get("name")]
-            if cards:
-                st.markdown(f"<span class='cap'>{len(cards)} match(es). Tap a card to open its full sheet.</span>",
-                            unsafe_allow_html=True)
-                card_tiles(sorted(cards, key=lambda c: -importance(c)), "lookpick", 4, 12)
+            fb = scry_named(q)
+            if fb and fb.get("name"):
+                st.markdown("<span class='cap'>Closest match</span>", unsafe_allow_html=True)
+                st.markdown("<div class='sugg'>", unsafe_allow_html=True)
+                if st.button(f"🔍  {fb['name']}", key="sugg_fb", use_container_width=True):
+                    show_card(fb)
+                st.markdown("</div>", unsafe_allow_html=True)
             else:
-                for i, n in enumerate(names[:12]):
-                    if st.button(n, key=f"lkname_{i}", use_container_width=True):
-                        fb = scry_named(n)
-                        if fb:
-                            show_card(fb)
+                st.info("No card found for that yet. Check the spelling, or try fewer letters.")
     else:
         st.markdown("<span class='cap'>Popular searches:</span>", unsafe_allow_html=True)
         chips = ["Ragavan", "Sol Ring", "Counterspell", "Spider-Man", "Lightning Bolt"]
@@ -699,13 +750,14 @@ with tab_sets:
                 ql = set_q.lower()
                 exact = [s for s in shown if ql in s["name"].lower() or ql in s.get("code", "").lower()]
                 if not exact:
-                    # forgiving: match on any word fragment overlap
-                    exact = [s for s in shown if any(w[:4] and w[:4] in s["name"].lower() for w in ql.split())]
+                    # forgiving: match any 3+ letter fragment of any typed word
+                    frags = [w for w in ql.split() if len(w) >= 3]
+                    exact = [s for s in shown if any(fr in s["name"].lower() for fr in frags)]
                 shown = exact
             if not shown:
                 st.info(f"No sets match \u201c{set_q}\u201d. Try a shorter word, like \u201cspider\u201d or \u201cfinal\u201d.")
             else:
-                st.markdown(f"<span class='cap'>{len(shown)} sets · newest first</span>", unsafe_allow_html=True)
+                st.markdown(f"<span class='cap'>{len(shown)} set(s) · newest first</span>", unsafe_allow_html=True)
                 for i, s in enumerate(shown[:60]):
                     cL, cR = st.columns([5, 1])
                     with cL:
@@ -722,11 +774,6 @@ with tab_sets:
 # ============================================================================
 # BUILDER
 # ============================================================================
-with tab_build:
-    st.markdown("### Build a deck")
-    st.markdown("<span class='cap'>Pick a card pool, tap the cards you like, and we build the deck around them.</span>",
-                unsafe_allow_html=True)
-
 with tab_build:
     st.markdown("### Build a deck")
     st.markdown("<span class='cap'>Tell us the brief, optionally tap a few favourite cards, and we assemble "
@@ -851,18 +898,46 @@ with tab_build:
 
             # ---- two charts that make sense ----
             ch1, ch2 = st.columns(2)
-            with ch1:
-                st.markdown("**Mana curve**")
-                curve = pd.Series([min(7, int(c.get("cmc", 0))) for c in used]).value_counts().sort_index()
-                curve.index = [(f"{i}" if i < 7 else "7+") for i in curve.index]
-                st.bar_chart(curve, color=ACCENT, height=200)
-            with ch2:
-                st.markdown("**Role mix**")
-                rc = {}
-                for c in used:
-                    r = "Other" if role(c) == "Spell" else role(c)
-                    rc[r] = rc.get(r, 0) + 1
-                st.bar_chart(pd.Series(rc).sort_values(ascending=False), color="#9a7bc4", height=200, horizontal=True)
+            try:
+                import altair as alt
+                with ch1:
+                    st.markdown("**Mana curve**  <span class='cap'>how many cards at each cost</span>",
+                                unsafe_allow_html=True)
+                    cv = {}
+                    for c in used:
+                        k = min(7, int(c.get("cmc", 0)))
+                        cv[k] = cv.get(k, 0) + 1
+                    cvdf = pd.DataFrame({"Mana value": [(f"{k}" if k < 7 else "7+") for k in range(8)],
+                                         "Cards": [cv.get(k, 0) for k in range(8)]})
+                    bar = (alt.Chart(cvdf).mark_bar(color=ACCENT, cornerRadius=3)
+                           .encode(x=alt.X("Mana value:N", sort=None, title="Mana value"),
+                                   y=alt.Y("Cards:Q", title="Cards"),
+                                   tooltip=["Mana value", "Cards"]).properties(height=240))
+                    st.altair_chart(bar, use_container_width=True)
+                with ch2:
+                    st.markdown("**Role mix**  <span class='cap'>what jobs the cards do</span>", unsafe_allow_html=True)
+                    rc = {}
+                    for c in used:
+                        r = "Other" if role(c) == "Spell" else role(c)
+                        rc[r] = rc.get(r, 0) + 1
+                    rdf = pd.DataFrame({"Role": list(rc.keys()), "Cards": list(rc.values())})
+                    rbar = (alt.Chart(rdf).mark_bar(color="#9a7bc4", cornerRadius=3)
+                            .encode(y=alt.Y("Role:N", sort="-x", title=None),
+                                    x=alt.X("Cards:Q", title="Cards"),
+                                    tooltip=["Role", "Cards"]).properties(height=240))
+                    st.altair_chart(rbar, use_container_width=True)
+            except Exception:
+                with ch1:
+                    st.markdown("**Mana curve**")
+                    curve = pd.Series([min(7, int(c.get("cmc", 0))) for c in used]).value_counts().sort_index()
+                    st.bar_chart(curve, color=ACCENT, height=220)
+                with ch2:
+                    st.markdown("**Role mix**")
+                    rc = {}
+                    for c in used:
+                        r = "Other" if role(c) == "Spell" else role(c)
+                        rc[r] = rc.get(r, 0) + 1
+                    st.bar_chart(pd.Series(rc).sort_values(ascending=False), color="#9a7bc4", height=220)
 
             # ---- visual deck grid ----
             st.markdown("**The deck**  <span class='cap'>tap any card to inspect it</span>", unsafe_allow_html=True)
@@ -886,44 +961,86 @@ with tab_build:
 # ============================================================================
 with tab_market:
     st.markdown("### Market")
-    st.markdown("<span class='cap'>Demand-driven 90-day outlook across the tracked cards.</span>",
-                unsafe_allow_html=True)
-    bull = sum(1 for c in POOL if delta_pct(c) > 0)
-    bear = len(POOL) - bull
-    total_val = sum(price_now(c) or 0 for c in POOL)
-    hi = max(POOL, key=lambda c: price_now(c) or 0)
-    mk1, mk2, mk3 = st.columns(3)
-    mk1.metric("Trending Up", bull, "of tracked cards")
-    mk2.metric("Trending Down", bear)
-    mk3.metric("Total Tracked Value", fmt_usd(total_val))
-    st.markdown(f"<span class='cap'>Priciest single card: {hi['name']} at {fmt_usd(price_now(hi))}.</span>",
-                unsafe_allow_html=True)
+    st.markdown("<span class='cap'>How the tracked cards are trending, and where value sits. "
+                "Movement is a 90-day model projection, not a guarantee.</span>", unsafe_allow_html=True)
 
-    rows = [{"Card": c["name"], "Demand": demand(c), "Now": round(price_now(c) or 0, 2),
-             "Proj 90d": round(proj_price(c) or 0, 2),
-             "Move %": round((proj_price(c) or 0) / (price_now(c) or 1) * 100 - 100, 1),
-             "Conf": confidence(c)} for c in POOL]
+    priced = [c for c in POOL if price_now(c)]
+    bull = sum(1 for c in priced if delta_pct(c) > 0.3)
+    bear = sum(1 for c in priced if delta_pct(c) < -0.3)
+    flat = len(priced) - bull - bear
+    total_val = sum(price_now(c) for c in priced)
+    hi = max(priced, key=lambda c: price_now(c)) if priced else None
+    mk1, mk2, mk3, mk4 = st.columns(4)
+    mk1.metric("Trending up", bull)
+    mk2.metric("Trending down", bear)
+    mk3.metric("Holding steady", flat)
+    mk4.metric("Total tracked value", fmt_usd(total_val))
+    if hi:
+        st.markdown(f"<span class='cap'>Priciest card tracked: <b class='gold'>{hi['name']}</b> at "
+                    f"{fmt_usd(price_now(hi))}. Prices are aggregated market values for study, not a quote.</span>",
+                    unsafe_allow_html=True)
+
+    # build a clean dataframe once
+    rows = []
+    for c in priced:
+        p = price_now(c)
+        rows.append({"Card": c["name"], "Power": importance(c), "Demand": demand(c),
+                     "Price": round(p, 2), "Proj 90d": round(proj_price(c), 2),
+                     "Move %": round(delta_pct(c), 1), "Confidence": confidence(c),
+                     "Role": role(c)})
     df = pd.DataFrame(rows)
-    st.markdown("**Demand vs price**  <span class='cap'>top-right is the conviction zone</span>",
+
+    st.divider()
+    st.markdown("#### Demand vs price")
+    st.markdown("<div class='legendrow'>Each dot is a card. "
+                "<span><span class='swatch' style='background:#5fc28a'></span>rising</span>"
+                "<span><span class='swatch' style='background:#df7261'></span>falling</span> "
+                "Up and to the right means high demand meeting high price.</div>", unsafe_allow_html=True)
+    try:
+        import altair as alt
+        sc = df.copy()
+        sc["Trend"] = np.where(sc["Move %"] >= 0, "Rising", "Falling")
+        chart = (alt.Chart(sc).mark_circle(opacity=0.7)
+                 .encode(
+                     x=alt.X("Demand:Q", title="Demand index"),
+                     y=alt.Y("Price:Q", title="Market price (USD)", scale=alt.Scale(type="symlog")),
+                     size=alt.Size("Power:Q", scale=alt.Scale(range=[20, 320]), title="Power"),
+                     color=alt.Color("Trend:N", scale=alt.Scale(domain=["Rising", "Falling"],
+                                                                range=["#5fc28a", "#df7261"]), legend=None),
+                     tooltip=["Card", "Power", "Demand", "Price", "Move %"])
+                 .properties(height=320).interactive())
+        st.altair_chart(chart, use_container_width=True)
+    except Exception:
+        st.scatter_chart(df, x="Demand", y="Price", height=300)
+
+    st.divider()
+    st.markdown("#### Biggest movers · next 90 days")
+    up_col, dn_col = st.columns(2)
+    risers = df.sort_values("Move %", ascending=False).head(8)
+    fallers = df.sort_values("Move %").head(8)
+    with up_col:
+        st.markdown("<span class='cap up'>▲ Projected to rise</span>", unsafe_allow_html=True)
+        st.dataframe(risers[["Card", "Price", "Proj 90d", "Move %"]], use_container_width=True, hide_index=True,
+                     column_config={"Price": st.column_config.NumberColumn(format="$%.2f"),
+                                    "Proj 90d": st.column_config.NumberColumn(format="$%.2f"),
+                                    "Move %": st.column_config.NumberColumn(format="%+.1f%%")})
+    with dn_col:
+        st.markdown("<span class='cap dn'>▼ Projected to dip</span>", unsafe_allow_html=True)
+        st.dataframe(fallers[["Card", "Price", "Proj 90d", "Move %"]], use_container_width=True, hide_index=True,
+                     column_config={"Price": st.column_config.NumberColumn(format="$%.2f"),
+                                    "Proj 90d": st.column_config.NumberColumn(format="$%.2f"),
+                                    "Move %": st.column_config.NumberColumn(format="%+.1f%%")})
+
+    st.divider()
+    st.markdown("#### Full valuation table")
+    st.markdown("<span class='cap'>Sort any column. Power and demand are model scores; price is the live market value.</span>",
                 unsafe_allow_html=True)
-    st.scatter_chart(df.sort_values("Demand", ascending=False).head(120), x="Demand", y="Now", height=260)
-
-    st.markdown("**Biggest movers · next 90 days**")
-    movers = df.reindex(df["Move %"].abs().sort_values(ascending=False).index).head(12)
-    st.dataframe(movers, use_container_width=True, hide_index=True,
-                 column_config={"Now": st.column_config.NumberColumn(format="$%.2f"),
+    st.dataframe(df.sort_values("Power", ascending=False), use_container_width=True, hide_index=True, height=440,
+                 column_config={"Price": st.column_config.NumberColumn(format="$%.2f"),
                                 "Proj 90d": st.column_config.NumberColumn(format="$%.2f"),
-                                "Move %": st.column_config.NumberColumn(format="%.1f%%")})
-
-    st.markdown("**Valuation table · top 100 by power**")
-    top = sorted(POOL, key=lambda c: -importance(c))[:100]
-    tdf = pd.DataFrame([{"Card": c["name"], "Power": importance(c), "Demand": demand(c),
-                         "Now": round(price_now(c) or 0, 2), "Proj 90d": round(proj_price(c) or 0, 2),
-                         "Move %": round(delta_pct(c), 1), "Conf": confidence(c)} for c in top])
-    st.dataframe(tdf, use_container_width=True, hide_index=True,
-                 column_config={"Now": st.column_config.NumberColumn(format="$%.2f"),
-                                "Proj 90d": st.column_config.NumberColumn(format="$%.2f"),
-                                "Move %": st.column_config.NumberColumn(format="%.1f%%")})
+                                "Move %": st.column_config.NumberColumn(format="%+.1f%%"),
+                                "Power": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
+                                "Demand": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d")})
 
 
 # ============================================================================
