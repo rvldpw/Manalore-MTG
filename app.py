@@ -1442,7 +1442,7 @@ with st.spinner("Opening the library..."):
     if _hf_pool and len(_hf_pool) > TARGET:
         # Sort by play-rate (edhrec_rank ascending = most played first)
         # Cap at 10,000 so the app stays fast; full data remains in HF for history/ML
-        HF_POOL_LIMIT = 10000
+        HF_POOL_LIMIT = 5000
         def _rank_key(c):
             try:
                 r = float(c.get("edhrec_rank") or 99999)
@@ -1495,8 +1495,7 @@ if HIST is not None and len(HIST) >= 80:
     FORECASTER = train_forecaster(_hist_sig, _hist_rows_compact, _attr_by_name)
 
 stamp = time.strftime("%I:%M %p").lstrip("0")
-_pool_desc = (f"the {len(POOL):,} most-played cards (from full database)" if _pool_source == "hf"
-              else f"the {len(POOL):,} most-played cards")
+_pool_desc = "the most-played cards in Magic"
 _hf_note = (f"&nbsp;&nbsp;·&nbsp;&nbsp;<span style='color:#df7261'>HF: {_hf_status}</span>"
             if _pool_source == "api" and HF_REPO else "")
 st.markdown(
@@ -1766,9 +1765,7 @@ def card_tiles(cards, where, cols_n=5, limit=40):
 # LIBRARY
 # ============================================================================
 with tab_lib:
-    _lib_desc = (f"The {len(POOL):,} most-played cards drawn from the full Magic database, "
-                 if _pool_source == "hf" else
-                 f"The {len(POOL):,} most-played cards, ")
+    _lib_desc = "The most-played cards in Magic, "
     st.markdown(f"<div class='hero'><h2>Read any card like a master.</h2>"
                 f"<p>{_lib_desc}each scored for power, demand and price outlook, "
                 "in plain language for newcomers and full depth for veterans.</p></div>",
