@@ -132,8 +132,13 @@ def load_full_pool_from_hf(repo):
         import pyarrow.parquet as pq
         from huggingface_hub import HfApi, hf_hub_download
         api = HfApi()
-        files = sorted([f for f in api.list_repo_files(repo_id=repo, repo_type="dataset")
-                        if f.startswith("data/library/snapshot_date=") and f.endswith(".parquet")])
+        # look in data/library/ first (new path), then fall back to data/snapshot_date=
+        # (old path where the collector may have written before the path change)
+        all_files = api.list_repo_files(repo_id=repo, repo_type="dataset")
+        files = sorted([f for f in all_files
+                        if (f.startswith("data/library/snapshot_date=") or
+                            f.startswith("data/snapshot_date="))
+                        and f.endswith(".parquet")])
         if not files:
             return None
         # scan newest-first; check only the Parquet schema (footer), not the whole file
