@@ -1,0 +1,29 @@
+name: Collect MTG price snapshot
+
+# Runs once a day and can also be triggered by hand from the Actions tab.
+on:
+  schedule:
+    - cron: "17 6 * * *"   # 06:17 UTC daily (off the hour to be polite to the API)
+  workflow_dispatch: {}
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pandas pyarrow huggingface_hub ijson
+
+      - name: Run collector
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
+        run: python collector.py
