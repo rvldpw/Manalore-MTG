@@ -1,0 +1,26 @@
+name: Seed historical price data (run once)
+
+on:
+  workflow_dispatch: {}   # only runs when you click "Run workflow" manually
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pandas pyarrow huggingface_hub ijson
+
+      - name: Run historical importer
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
+        run: python import_history.py
