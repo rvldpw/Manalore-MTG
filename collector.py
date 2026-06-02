@@ -139,16 +139,17 @@ def main():
     size_mb = os.path.getsize(out_path) / 1e6
     print(f"Wrote {out_path} ({size_mb:.1f} MB)")
 
-    # upload to HF under a dated partition
+    # upload to HF under data/library/ (separate from price history in data/prices/)
     from huggingface_hub import HfApi
     api = HfApi(token=token)
     api.create_repo(repo_id=repo, repo_type="dataset", exist_ok=True)
-    path_in_repo = f"data/snapshot_date={today}/cards.parquet"
+    path_in_repo = f"data/library/snapshot_date={today}/cards.parquet"
     print(f"Uploading to {repo}:{path_in_repo} ...")
+    print(f"  {kept} cards, {size_mb:.1f} MB, {len(df.columns)} columns")
     api.upload_file(path_or_fileobj=out_path, path_in_repo=path_in_repo,
                     repo_id=repo, repo_type="dataset",
-                    commit_message=f"Snapshot {today} ({kept} cards)")
-    print("Done.")
+                    commit_message=f"Full library snapshot {today} ({kept} cards, {len(df.columns)} cols)")
+    print(f"Done. Columns written: {list(df.columns)[:8]}...")
 
 
 if __name__ == "__main__":
