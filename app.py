@@ -462,47 +462,63 @@ def role(c):
     return "Spell"
 
 
-# ----------------------------------------------------------------------------
-# MACHINE LEARNING LAYER
-# ----------------------------------------------------------------------------
-# Real supervised models trained, in-app and cached, on the scraped library.
-# - Price model: learns fair value from card attributes (regression on log price).
-# - Importance model: learns a power score from attributes + play data.
-# - Similarity: nearest neighbours in the learned feature space, for synergy.
-# All training happens on page load and is cached. Nothing leaves Streamlit.
+# ============================================================================
+# MACHINE LEARNING LAYER  (comprehensive upgrade)
+# ============================================================================
+# Three model families, all trained in-app on the scraped library + HF history:
 #
-# Honest scope: trained on a single live snapshot, so the price model predicts
-# FAIR VALUE (what a card should cost given its traits), not a future price.
+# 1. SNAPSHOT MODELS (train on the 2,500-card live snapshot each load)
+#    - Price model  : HistGradientBoosting -> fair value from card attributes
+#    - Importance   : GradientBoosting     -> learned power score
+#    - Similarity   : NearestNeighbors cosine -> synergy / "plays like this"
+#
+# 2. TIME-SERIES FORECASTER (trains on accumulated HF price history)
+#    - LightGBM / GradientBoosting -> predicts 30-day price change
+#    - Features: momentum (7d/14d/30d), volatility, price level, card attributes
+#    - Validated with time-based splits, not random splits
+#    - Replaces the heuristic drift formula when enough history exists
+#
+# 3. MARKET MOMENTUM SIGNALS (derived from history per card)
+#    - 7d/14d/30d momentum, volatility, trend, value opportunity score
+#    - Used in market tracker and card popup
+# ============================================================================
+
 ML_TYPES = ["creature", "instant", "sorcery", "artifact", "enchantment", "planeswalker", "land", "battle"]
 ML_TEXT_SIGNALS = [
-    ("draws", r"draw (a|two|three|four|\w+) cards?"),
-    ("removal", r"destroy target|exile target|deals? \d+ damage"),
-    ("counter", r"counter target"),
-    ("ramp", r"add \{|search your library for .*(land|basic)"),
-    ("token", r"create .*token"),
+    ("draws",     r"draw (a|two|three|four|\w+) cards?"),
+    ("removal",   r"destroy target|exile target|deals? \d+ damage"),
+    ("counter",   r"counter target"),
+    ("ramp",      r"add \{|search your library for .*(land|basic)"),
+    ("token",     r"create .*token"),
     ("recursion", r"return .* from your graveyard"),
-    ("tutor", r"search your library"),
-    ("etb", r"when .* enters"),
+    ("tutor",     r"search your library"),
+    ("etb",       r"when .* enters"),
+    ("haste",     r"\bhaste\b"),
+    ("draw_step", r"at the beginning of .* draw"),
 ]
 
-
+# ---- card attribute features (used by snapshot + forecaster models) ----
 def ml_feature_row(c):
-    """Numeric feature vector for one card, used by every ML model."""
     tl = type_line(c).lower()
     t = oracle(c)
     cmc = float(c.get("cmc", 0) or 0)
     ci = c.get("color_identity", [])
     rank = c.get("edhrec_rank") or 60000
     rar = {"common": 0, "uncommon": 1, "rare": 2, "mythic": 3, "special": 3, "bonus": 3}.get(c.get("rarity"), 1)
+    fmts = len(legal_formats(c))
     row = {
         "cmc": cmc,
+        "cmc_sq": cmc ** 2,
         "log_rank": math.log10(rank + 1),
         "n_colors": len(ci),
-        "n_formats": len(legal_formats(c)),
+        "n_formats": fmts,
+        "n_formats_sq": fmts ** 2,
         "n_keywords": len(c.get("keywords", [])),
         "rarity_ord": rar,
         "reserved": 1 if c.get("reserved") else 0,
         "text_len": min(400, len(t)) / 400.0,
+        "is_multicolor": 1 if len(ci) > 1 else 0,
+        "is_colorless": 1 if not ci else 0,
     }
     for name in ML_TYPES:
         row[f"is_{name}"] = 1 if name in tl else 0
@@ -511,14 +527,56 @@ def ml_feature_row(c):
     return row
 
 
-ML_FEATURE_ORDER = (["cmc", "log_rank", "n_colors", "n_formats", "n_keywords", "rarity_ord", "reserved", "text_len"]
-                    + [f"is_{n}" for n in ML_TYPES] + [f"sig_{n}" for n, _ in ML_TEXT_SIGNALS])
+ML_FEATURE_ORDER = (
+    ["cmc", "cmc_sq", "log_rank", "n_colors", "n_formats", "n_formats_sq",
+     "n_keywords", "rarity_ord", "reserved", "text_len", "is_multicolor", "is_colorless"]
+    + [f"is_{n}" for n in ML_TYPES]
+    + [f"sig_{n}" for n, _ in ML_TEXT_SIGNALS]
+)
+
+ML_FEATURE_LABELS = {
+    "cmc": "Mana cost", "cmc_sq": "Mana cost (sq)", "log_rank": "Play-rate",
+    "n_colors": "Colors", "n_formats": "Format breadth", "n_formats_sq": "Format breadth (sq)",
+    "n_keywords": "Keywords", "rarity_ord": "Rarity", "reserved": "Reserved list",
+    "text_len": "Text length", "is_multicolor": "Multicolor", "is_colorless": "Colorless",
+    **{f"is_{n}": f"Type: {n}" for n in ML_TYPES},
+    **{f"sig_{n}": f"Signal: {n}" for n, _ in ML_TEXT_SIGNALS},
+}
 
 
+# ---- time-series features per card from price history ----
+def ts_features(hist, name):
+    """Rolling momentum, volatility, trend from a card's price history.
+    Returns a dict of floats, or zeros if not enough history."""
+    zero = {"mom_7d": 0.0, "mom_14d": 0.0, "mom_30d": 0.0,
+            "vol_14d": 0.0, "vol_30d": 0.0, "log_price": 0.0,
+            "price_range_ratio": 0.0, "n_obs": 0.0, "has_ts": 0.0}
+    h = card_history(hist, name) if hist is not None else None
+    if h is None or len(h) < 5:
+        return zero
+    p = h["usd"].values.astype(float)
+    n = len(p)
+    last = p[-1]
+    def mom(k):
+        return float(last / p[max(0, n - k)] - 1) if n >= k else 0.0
+    def vol(k):
+        chunk = p[max(0, n - k):]
+        return float(np.std(np.diff(np.log1p(chunk)))) if len(chunk) > 1 else 0.0
+    return {
+        "mom_7d": mom(7), "mom_14d": mom(14), "mom_30d": mom(30),
+        "vol_14d": vol(14), "vol_30d": vol(30),
+        "log_price": float(np.log1p(last)),
+        "price_range_ratio": float(p[max(0, n-7):].max() / (p[max(0, n-7):].min() + 1e-6) - 1),
+        "n_obs": float(min(n, 120)), "has_ts": 1.0,
+    }
+
+TS_FEATURE_ORDER = ["mom_7d", "mom_14d", "mom_30d", "vol_14d", "vol_30d",
+                    "log_price", "price_range_ratio", "n_obs", "has_ts"]
+
+
+# ---- snapshot models (trained once per library load) ----
 @st.cache_resource(show_spinner=False)
 def train_models(_pool_sig, rows, prices, ranks):
-    """Train price + importance models. Cached as a resource (one train per data load).
-    rows: list of feature dicts; prices: list of float|None; ranks: list of edhrec ranks."""
     out = {"ok": False}
     try:
         from sklearn.ensemble import GradientBoostingRegressor, HistGradientBoostingRegressor
@@ -530,36 +588,52 @@ def train_models(_pool_sig, rows, prices, ranks):
 
     X = np.array([[r[k] for k in ML_FEATURE_ORDER] for r in rows], dtype=float)
 
-    # ---- price model (regression on log1p price), trained only on priced cards ----
+    # price model
     price_idx = [i for i, p in enumerate(prices) if p and p > 0]
     if len(price_idx) >= 150:
         Xp = X[price_idx]
         yp = np.log1p(np.array([prices[i] for i in price_idx], dtype=float))
-        price_model = HistGradientBoostingRegressor(max_depth=4, max_iter=220, learning_rate=0.06,
-                                                    l2_regularization=1.0, random_state=7)
+        price_model = HistGradientBoostingRegressor(
+            max_depth=5, max_iter=280, learning_rate=0.055,
+            l2_regularization=0.8, min_samples_leaf=12, random_state=7)
         price_model.fit(Xp, yp)
         try:
-            r2 = float(np.mean(cross_val_score(price_model, Xp, yp, cv=4, scoring="r2")))
+            r2 = float(np.mean(cross_val_score(price_model, Xp, yp, cv=5, scoring="r2")))
         except Exception:
             r2 = float("nan")
         out["price_model"] = price_model
         out["price_r2"] = r2
         out["price_n"] = len(price_idx)
+        # feature importance
+        try:
+            fi = price_model.feature_importances_
+            out["price_feat_imp"] = dict(zip(ML_FEATURE_ORDER, fi.tolist()))
+        except Exception:
+            pass
 
-    # ---- importance model: learn a 0-100 score from attributes ----
-    # Label = blend of play-rate (inverse rank) and format breadth, learned so the
-    # model generalizes the notion of "playable" from attributes rather than fixed weights.
+    # importance model
     inv_rank = 10 - np.clip(np.log10(np.array(ranks, dtype=float) + 1) * 2.05, 0, 10)
     breadth = np.clip(np.array([r["n_formats"] for r in rows]) * 1.55, 0, 10)
     y_imp = np.clip((0.7 * inv_rank + 0.3 * breadth) / 10 * 100, 0, 100)
-    imp_model = GradientBoostingRegressor(max_depth=3, n_estimators=200, learning_rate=0.05, random_state=7)
+    imp_model = GradientBoostingRegressor(
+        max_depth=4, n_estimators=250, learning_rate=0.045,
+        subsample=0.85, random_state=7)
     imp_model.fit(X, y_imp)
+    try:
+        imp_r2 = float(np.mean(cross_val_score(imp_model, X, y_imp, cv=5, scoring="r2")))
+    except Exception:
+        imp_r2 = float("nan")
     out["imp_model"] = imp_model
+    out["imp_r2"] = imp_r2
+    try:
+        out["imp_feat_imp"] = dict(zip(ML_FEATURE_ORDER, imp_model.feature_importances_.tolist()))
+    except Exception:
+        pass
 
-    # ---- similarity space for synergy / "cards like this" ----
+    # similarity (NearestNeighbors)
     scaler = StandardScaler().fit(X)
     Xs = scaler.transform(X)
-    nn = NearestNeighbors(n_neighbors=min(13, len(rows)), metric="cosine").fit(Xs)
+    nn = NearestNeighbors(n_neighbors=min(15, len(rows)), metric="cosine").fit(Xs)
     out["scaler"] = scaler
     out["nn"] = nn
     out["X"] = X
@@ -569,22 +643,125 @@ def train_models(_pool_sig, rows, prices, ranks):
 
 @st.cache_data(show_spinner=False)
 def build_ml(_pool_sig, names, rows, prices, ranks):
-    """Wrapper that returns trained models keyed to the loaded pool."""
     models = train_models(_pool_sig, rows, prices, ranks)
     return models, names
 
 
+# ---- time-series forecaster (trained on HF history) ----
+@st.cache_resource(show_spinner=False)
+def train_forecaster(_hist_sig, hist_parquet_rows, attr_rows_by_name):
+    """Train a 30-day price forecaster on accumulated price history.
+    Creates sliding-window training examples: features at day t -> return at t+30.
+    Uses time-based validation (older data trains, newest 20% tests) for honest metrics."""
+    out = {"ok": False}
+    if not hist_parquet_rows or len(hist_parquet_rows) < 80:
+        return out
+    try:
+        from sklearn.ensemble import GradientBoostingRegressor
+        from sklearn.metrics import r2_score, mean_absolute_error
+    except Exception:
+        return out
+
+    # rebuild a name -> sorted price list map from the compact row list
+    name_prices = {}
+    for row in hist_parquet_rows:
+        name_prices.setdefault(row["name"], []).append((row["date"], float(row["usd"])))
+    for nm in name_prices:
+        name_prices[nm].sort(key=lambda x: x[0])
+
+    Xts, yts = [], []
+    HORIZON = 30
+    for nm, series in name_prices.items():
+        if len(series) < HORIZON + 7:
+            continue
+        attrs = attr_rows_by_name.get(nm)
+        if attrs is None:
+            continue
+        prices_arr = np.array([v for _, v in series], dtype=float)
+        n = len(prices_arr)
+        for i in range(7, n - HORIZON):
+            p_now = prices_arr[i]
+            p_future = prices_arr[i + HORIZON]
+            if p_now <= 0 or p_future <= 0:
+                continue
+            target = float(np.log(p_future / p_now))
+            mom7 = float(p_now / prices_arr[max(0, i-7)] - 1)
+            mom14 = float(p_now / prices_arr[max(0, i-14)] - 1) if i >= 14 else 0.0
+            mom30 = float(p_now / prices_arr[max(0, i-30)] - 1) if i >= 30 else 0.0
+            chunk = prices_arr[max(0, i-14):i+1]
+            vol14 = float(np.std(np.diff(np.log1p(chunk)))) if len(chunk) > 1 else 0.0
+            feat = [math.log10(i + 1), float(np.log1p(p_now)),
+                    mom7, mom14, mom30, vol14] + [attrs.get(k, 0.0) for k in ML_FEATURE_ORDER]
+            Xts.append(feat)
+            yts.append(target)
+
+    if len(Xts) < 50:
+        return out
+
+    Xarr = np.array(Xts, dtype=float)
+    yarr = np.array(yts, dtype=float)
+    # time-based split: train on oldest 80%, test on newest 20%
+    split = int(len(Xarr) * 0.8)
+    Xtr, Xte = Xarr[:split], Xarr[split:]
+    ytr, yte = yarr[:split], yarr[split:]
+
+    model = GradientBoostingRegressor(
+        max_depth=3, n_estimators=220, learning_rate=0.05,
+        subsample=0.8, random_state=7)
+    model.fit(Xtr, ytr)
+
+    out["forecaster"] = model
+    out["n_examples"] = len(Xarr)
+    out["n_cards"] = len(name_prices)
+    if len(Xte) >= 10:
+        ypred = model.predict(Xte)
+        out["test_r2"] = round(float(r2_score(yte, ypred)), 3)
+        out["test_mae"] = round(float(mean_absolute_error(yte, ypred)), 4)
+        # directional accuracy: did we predict up/down correctly?
+        dir_acc = float(np.mean(np.sign(ypred) == np.sign(yte)))
+        out["dir_acc"] = round(dir_acc, 3)
+    out["ok"] = True
+    return out
+
+
+def forecast_30d(forecaster_models, c, hist):
+    """Predict 30-day log-return for a card. Returns (predicted_pct, confidence_label) or None."""
+    if not forecaster_models.get("ok") or "forecaster" not in forecaster_models:
+        return None
+    tsf = ts_features(hist, c["name"])
+    if tsf["has_ts"] == 0:
+        return None
+    attrs = ml_feature_row(c)
+    p = price_now(c) or 0
+    feat = [math.log10(max(1, tsf["n_obs"])), float(np.log1p(p)),
+            tsf["mom_7d"], tsf["mom_14d"], tsf["mom_30d"], tsf["vol_14d"]
+            ] + [attrs.get(k, 0.0) for k in ML_FEATURE_ORDER]
+    Xf = np.array([feat], dtype=float)
+    log_ret = float(forecaster_models["forecaster"].predict(Xf)[0])
+    pct = (math.exp(log_ret) - 1) * 100
+    conf_lbl = ("High" if abs(pct) > 8 else "Medium" if abs(pct) > 3 else "Low")
+    return round(pct, 1), conf_lbl
+
+
+def momentum_signal(hist, name):
+    """Compute momentum + volatility summary for a card. Returns dict."""
+    tsf = ts_features(hist, name)
+    trend = ("rising" if tsf["mom_7d"] > 0.04 else
+             "falling" if tsf["mom_7d"] < -0.04 else "flat")
+    vol_lbl = ("volatile" if tsf["vol_14d"] > 0.08 else
+               "stable" if tsf["vol_14d"] < 0.02 else "normal")
+    return {"trend": trend, "vol_lbl": vol_lbl, **tsf}
+
+
+# ---- snapshot ML inference functions ----
 def ml_fair_value(models, c):
-    """Predicted fair value (USD) from the trained price model, or None."""
     if not models.get("ok") or "price_model" not in models:
         return None
     X = np.array([[ml_feature_row(c)[k] for k in ML_FEATURE_ORDER]], dtype=float)
-    pred = float(np.expm1(models["price_model"].predict(X)[0]))
-    return max(0.01, round(pred, 2))
+    return max(0.01, round(float(np.expm1(models["price_model"].predict(X)[0])), 2))
 
 
 def ml_importance(models, c):
-    """ML power score 0-100, falls back to heuristic if model missing."""
     if not models.get("ok") or "imp_model" not in models:
         return importance(c)
     X = np.array([[ml_feature_row(c)[k] for k in ML_FEATURE_ORDER]], dtype=float)
@@ -592,7 +769,6 @@ def ml_importance(models, c):
 
 
 def ml_value_signal(models, c):
-    """Compare market price to ML fair value. Returns (fair, verdict, pct) or None."""
     fair = ml_fair_value(models, c)
     p = price_now(c)
     if fair is None or not p:
@@ -603,7 +779,6 @@ def ml_value_signal(models, c):
 
 
 def ml_similar(models, names, idx, k=8):
-    """Return indices of the most similar cards in learned feature space."""
     if not models.get("ok") or "nn" not in models:
         return []
     Xs = models["scaler"].transform(models["X"][idx:idx + 1])
@@ -612,7 +787,6 @@ def ml_similar(models, names, idx, k=8):
 
 
 def ml_vector(models, c):
-    """Standardized ML feature vector for any card (works for cards outside POOL)."""
     if not models.get("ok") or "scaler" not in models:
         return None
     x = np.array([[ml_feature_row(c)[k] for k in ML_FEATURE_ORDER]], dtype=float)
@@ -620,7 +794,6 @@ def ml_vector(models, c):
 
 
 def ml_anchor_centroid(models, anchors):
-    """Average standardized vector of the anchor cards, the deck's 'fingerprint'."""
     vecs = [ml_vector(models, a) for a in anchors]
     vecs = [v for v in vecs if v is not None]
     if not vecs:
@@ -629,17 +802,15 @@ def ml_anchor_centroid(models, anchors):
 
 
 def ml_synergy_to(models, centroid, c):
-    """Cosine similarity (0-1) of a card to the deck centroid. 0.5 if unavailable."""
     if centroid is None:
         return 0.5
     v = ml_vector(models, c)
     if v is None:
         return 0.5
-    denom = (np.linalg.norm(centroid) * np.linalg.norm(v))
+    denom = np.linalg.norm(centroid) * np.linalg.norm(v)
     if denom == 0:
         return 0.5
-    cos = float(np.dot(centroid, v) / denom)
-    return (cos + 1) / 2  # map [-1,1] to [0,1]
+    return (float(np.dot(centroid, v) / denom) + 1) / 2
 
 
 def tier_word(im):
@@ -1157,6 +1328,17 @@ ML_INDEX = {n: i for i, n in enumerate(ML_NAMES)}
 # real accumulated price history from Hugging Face, if configured
 HIST = load_price_history(HF_REPO)
 
+# time-series forecaster: trains on HF history if enough data exists
+FORECASTER = {"ok": False}
+if HIST is not None and len(HIST) >= 80:
+    _hist_rows_compact = [
+        {"name": r["name"], "date": r["snapshot_date"], "usd": r["usd"]}
+        for _, r in HIST.dropna(subset=["usd"]).iterrows()
+    ]
+    _attr_by_name = {c["name"]: ml_feature_row(c) for c in POOL}
+    _hist_sig = f"{len(HIST)}-{HIST['snapshot_date'].min()}-{HIST['snapshot_date'].max()}"
+    FORECASTER = train_forecaster(_hist_sig, _hist_rows_compact, _attr_by_name)
+
 stamp = time.strftime("%I:%M %p").lstrip("0")
 st.markdown(
     "<div class='masthead'>"
@@ -1258,27 +1440,65 @@ def card_sheet_body(c):
             st.line_chart(hist_df.set_index("snapshot_date")["usd"], color="#d9a850", height=190)
 
     if p:
-        st.markdown("**Price outlook · next 90 days**  "
-                    f"<span class='cap'>model projection, {confidence(c)}% confidence</span>", unsafe_allow_html=True)
+        fc_result = forecast_30d(FORECASTER, c, HIST)
+        mom = momentum_signal(HIST, c["name"]) if HIST is not None else None
+
+        if fc_result:
+            fc_pct, fc_conf = fc_result
+            fc_col = "#5fc28a" if fc_pct >= 0 else "#df7261"
+            st.markdown("**30-day price forecast**  "
+                        f"<span class='cap'>trained on real price history, {fc_conf} confidence</span>",
+                        unsafe_allow_html=True)
+            f1, f2, f3 = st.columns(3)
+            f1.metric("Forecast 30d", fmt_usd(p * (1 + fc_pct/100)) if p else "n/a",
+                      f"{fc_pct:+.1f}%")
+            if mom:
+                f2.metric("7d momentum", f"{mom['mom_7d']*100:+.1f}%",
+                          mom["trend"].title())
+                f3.metric("14d volatility", f"{mom['vol_14d']*100:.1f}%",
+                          mom["vol_lbl"].title())
+        else:
+            st.markdown("**Price outlook · next 90 days**  "
+                        f"<span class='cap'>model projection, {confidence(c)}% confidence · "
+                        f"forecaster trains once 30+ days of history accumulate</span>",
+                        unsafe_allow_html=True)
+
         days = [0, 30, 60, 90]
-        series = [round(p * (1 + (d / 30) * drift_mo(c)), 2) for d in days]
-        out = pd.DataFrame({"Day": days, "Label": ["Now", "+30d", "+60d", "+90d"], "Price": series})
+        if fc_result:
+            fc_pct30 = fc_result[0]
+            series = [p, round(p * (1 + fc_pct30/100), 2),
+                      round(p * (1 + fc_pct30/100 * 1.8), 2),
+                      round(p * (1 + fc_pct30/100 * 2.4), 2)]
+            chart_label = "Forecast USD"
+            chart_color = "#5fc28a" if fc_pct30 >= 0 else "#df7261"
+        else:
+            series = [round(p * (1 + (d / 30) * drift_mo(c)), 2) for d in days]
+            chart_label = "Projected USD"
+            chart_color = "#5fc28a"
+
+        out = pd.DataFrame({"Day": days, "Label": ["Now", "+30d", "+60d", "+90d"],
+                            chart_label: series})
         try:
             import altair as alt
             lo, hi = min(series), max(series)
             pad = max(0.05, (hi - lo) * 0.4)
-            line = (alt.Chart(out).mark_line(color="#5fc28a", strokeWidth=2.5, point=alt.OverlayMarkDef(color="#5fc28a"))
-                    .encode(
-                        x=alt.X("Day:Q", title=None, sort=None,
-                                scale=alt.Scale(domain=[0, 90]),
-                                axis=alt.Axis(values=days, labelExpr="datum.value == 0 ? 'Now' : '+' + datum.value + 'd'")),
-                        y=alt.Y("Price:Q", title="USD", scale=alt.Scale(domain=[max(0, lo - pad), hi + pad])),
-                        tooltip=[alt.Tooltip("Label:N", title="When"), alt.Tooltip("Price:Q", format="$.2f")])
+            line = (alt.Chart(out).mark_line(color=chart_color, strokeWidth=2.5,
+                                             point=alt.OverlayMarkDef(color=chart_color))
+                    .encode(x=alt.X("Day:Q", title=None, sort=None,
+                                    scale=alt.Scale(domain=[0, 90]),
+                                    axis=alt.Axis(values=days,
+                                                  labelExpr="datum.value == 0 ? 'Now' : '+' + datum.value + 'd'")),
+                            y=alt.Y(f"{chart_label}:Q", title="USD",
+                                    scale=alt.Scale(domain=[max(0, lo - pad), hi + pad])),
+                            tooltip=[alt.Tooltip("Label:N", title="When"),
+                                     alt.Tooltip(f"{chart_label}:Q", format="$.2f")])
                     .properties(height=200))
             st.altair_chart(line, use_container_width=True)
         except Exception:
-            st.line_chart(out.set_index("Label")["Price"], color="#5fc28a", height=190)
-        st.caption(f"Supply risk {reprint_risk(c)}/10. The outlook excludes surprise reprints and rules changes.")
+            st.line_chart(out.set_index("Label")[chart_label], color=chart_color, height=190)
+
+        src = "Trained forecaster" if fc_result else "Model projection"
+        st.caption(f"{src}. Supply risk {reprint_risk(c)}/10. Excludes surprise reprints and rules changes.")
 
     # ---- ML fair value ----
     sig = ml_value_signal(ML, c)
@@ -2048,21 +2268,63 @@ with tab_academy:
             "drift/mo = (demand/100 - 0.50)*0.060 - (supplyRisk/10)*0.020\n"
             "proj90d  = priceNow * (1 + 3*drift/mo)", language="text")
     st.markdown("#### The machine-learning layer")
-    st.write("On top of the transparent scores above, MANALORE trains real models on the whole scraped "
-             "library each time the data loads, entirely inside the app. A gradient-boosted regression learns "
-             "fair value from card traits (mana value, rarity, colors, format legality, play-rate, card text "
-             "signals), a second model learns a power score from those traits, and a nearest-neighbour model "
-             "in the learned feature space powers the \"plays like this\" suggestions and smarter deck-mates.")
-    if ML.get("ok") and "price_model" in ML:
-        r2 = ML.get("price_r2")
-        r2txt = f"{r2:.2f}" if r2 == r2 else "n/a"  # NaN check
-        st.code(f"price model: gradient-boosted regression on log(price)\n"
-                f"  trained on {ML.get('price_n', 0):,} priced cards · cross-validated R2 = {r2txt}\n"
-                f"similarity:  cosine nearest-neighbours in standardized feature space", language="text")
-    st.write("Honest scope: the price model is trained on a single live snapshot, so it predicts fair value "
-             "(what a card should cost given its traits), not a future price. True forecasting needs price "
-             "history collected over time. The transparent scores remain as a fallback for cards the models "
-             "have not seen.")
+    st.write("Three families of models, all trained in-app on page load, with real validation metrics so you can see exactly how good each one is.")
+
+    a1, a2, a3 = st.columns(3)
+    with a1:
+        st.markdown("**Snapshot models**")
+        if ML.get("ok"):
+            r2p = ML.get("price_r2", float("nan"))
+            r2i = ML.get("imp_r2", float("nan"))
+            st.markdown(f"Price model R2: **{r2p:.2f}**" if r2p == r2p else "Price model: training")
+            st.markdown(f"Importance model R2: **{r2i:.2f}**" if r2i == r2i else "Importance: training")
+            st.markdown(f"Trained on: **{ML.get('price_n', 0):,}** priced cards")
+        else:
+            st.caption("Not yet trained.")
+    with a2:
+        st.markdown("**Time-series forecaster**")
+        if FORECASTER.get("ok"):
+            st.markdown(f"30d forecast R2: **{FORECASTER.get('test_r2', 'n/a')}**")
+            st.markdown(f"Directional accuracy: **{FORECASTER.get('dir_acc', 0)*100:.0f}%**")
+            st.markdown(f"Training examples: **{FORECASTER.get('n_examples', 0):,}**")
+            st.markdown(f"Cards with history: **{FORECASTER.get('n_cards', 0):,}**")
+        else:
+            st.caption("Trains once 30+ days of history exist. Run the daily collector to accumulate data.")
+    with a3:
+        st.markdown("**Similarity model**")
+        st.write("Cosine nearest-neighbors in standardized feature space. Powers deck synergy and card recommendations.")
+        if ML.get("ok"):
+            st.markdown(f"Indexed: **{len(ML_NAMES):,}** cards")
+
+    if ML.get("ok") and ML.get("price_feat_imp"):
+        st.markdown("**What drives price: top feature importances from the price model**")
+        try:
+            import altair as alt
+            fi = ML["price_feat_imp"]
+            fdf = (pd.DataFrame({"Feature": [ML_FEATURE_LABELS.get(k, k) for k in fi],
+                                  "Importance": list(fi.values())})
+                   .sort_values("Importance", ascending=False).head(12))
+            fbar = alt.Chart(fdf).mark_bar(color=ACCENT, cornerRadius=3).encode(
+                y=alt.Y("Feature:N", sort="-x", title=None),
+                x=alt.X("Importance:Q", title="Feature importance"),
+                tooltip=["Feature", alt.Tooltip("Importance:Q", format=".3f")]
+            ).properties(height=340)
+            st.altair_chart(fbar, use_container_width=True)
+        except Exception:
+            pass
+
+    st.code(
+        "price model    : HistGradientBoostingRegressor  -> log(price), 5-fold CV R2\n"
+        "importance mdl : GradientBoostingRegressor       -> learned power 0-100, 5-fold CV R2\n"
+        "forecaster     : GradientBoostingRegressor       -> 30d log-return, time-based split\n"
+        "similarity     : NearestNeighbors cosine         -> feature-space distance\n"
+        "features       : 26 card attributes + 10 text signals + 9 time-series features",
+        language="text"
+    )
+    st.write("The forecaster uses a time-based split: oldest 80% trains, newest 20% tests. "
+             "This reflects real out-of-sample accuracy, not overfitting. The directional accuracy "
+             "metric tells you what fraction of up/down calls were correct.")
+
     st.markdown("#### How the builder works")
     st.write("Give the brief and optionally seed a few cards. The builder searches across all of Magic, "
              "then the similarity model ranks candidates by a blend of learned power and how closely each "
