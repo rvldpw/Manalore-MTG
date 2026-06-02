@@ -1442,7 +1442,7 @@ with st.spinner("Opening the library..."):
     if _hf_pool and len(_hf_pool) > TARGET:
         # Sort by play-rate (edhrec_rank ascending = most played first)
         # Cap at 10,000 so the app stays fast; full data remains in HF for history/ML
-        HF_POOL_LIMIT = 5000
+        HF_POOL_LIMIT = 2500
         def _rank_key(c):
             try:
                 r = float(c.get("edhrec_rank") or 99999)
