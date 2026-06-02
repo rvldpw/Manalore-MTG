@@ -36,37 +36,46 @@ TARGET = 2500
 # Set HF_DATASET_REPO in Streamlit secrets to enable real price history + forecasting.
 # Reads are public for a public dataset; no token needed to read.
 HF_REPO = None
+HF_TOKEN_VAL = None
 try:
-    HF_REPO = st.secrets.get("HF_DATASET_REPO")  # e.g. "you/manalore-mtg-history"
+    HF_REPO = st.secrets.get("HF_DATASET_REPO")
+    HF_TOKEN_VAL = st.secrets.get("HF_TOKEN")
 except Exception:
     HF_REPO = None
+    HF_TOKEN_VAL = None
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def load_price_history(repo, max_snapshots=120):
-    """Load accumulated daily price snapshots from the Hugging Face dataset.
-    Returns a tidy DataFrame [snapshot_date, name, set, usd] or None if unavailable.
-    Reads only the slim columns needed, across available dated partitions."""
+def load_price_history(repo, token=None, max_snapshots=120):
+    """Load accumulated daily price snapshots from the Hugging Face dataset."""
     if not repo:
         return None
     try:
         from huggingface_hub import HfApi
         import json as _json
-        api = HfApi()
+        api = HfApi(token=token)
         files = api.list_repo_files(repo_id=repo, repo_type="dataset")
         parts = sorted([f for f in files if f.startswith("data/prices/snapshot_date=") and f.endswith(".parquet")])
+        if not parts:
+            # fall back to old path structure
+            parts = sorted([f for f in files if f.startswith("data/snapshot_date=") and f.endswith(".parquet")])
         parts = parts[-max_snapshots:]
         if not parts:
             return None
         frames = []
+        hdrs = {"User-Agent": "Manalore/1.0",
+                **({"Authorization": f"Bearer {token}"} if token else {})}
         for p in parts:
             url = f"https://huggingface.co/datasets/{repo}/resolve/main/{p}"
             try:
-                # read only the columns we need to keep it light
-                df = pd.read_parquet(url, columns=["snapshot_date", "name", "set", "prices"])
+                import io
+                r = requests.get(url, timeout=120, headers=hdrs)
+                if not r.ok:
+                    continue
+                df = pd.read_parquet(io.BytesIO(r.content),
+                                     columns=["snapshot_date", "name", "set", "prices"])
             except Exception:
-                df = pd.read_parquet(url)
-            # extract usd from the JSON-encoded prices field
+                continue
             def _usd(x):
                 try:
                     d = _json.loads(x) if isinstance(x, str) else (x or {})
@@ -76,9 +85,10 @@ def load_price_history(repo, max_snapshots=120):
                     return None
             df["usd"] = df["prices"].map(_usd)
             frames.append(df[["snapshot_date", "name", "set", "usd"]])
+        if not frames:
+            return None
         hist = pd.concat(frames, ignore_index=True)
-        hist = hist.dropna(subset=["usd"])
-        return hist
+        return hist.dropna(subset=["usd"])
     except Exception:
         return None
 
@@ -120,7 +130,7 @@ def load_library(target=TARGET):
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
-def load_full_pool_from_hf(repo):
+def load_full_pool_from_hf(repo, token=None):
     """Load the full card library from HF. Uses direct requests+BytesIO.
     Returns (cards_list, status_message) so the UI can show what happened."""
     if not repo:
@@ -129,7 +139,7 @@ def load_full_pool_from_hf(repo):
         import io, json as _json
         import pyarrow.parquet as pq
         from huggingface_hub import HfApi
-        api = HfApi()
+        api = HfApi(token=token)
         all_files = list(api.list_repo_files(repo_id=repo, repo_type="dataset"))
         files = sorted(
             [f for f in all_files
@@ -149,7 +159,8 @@ def load_full_pool_from_hf(repo):
             url = f"https://huggingface.co/datasets/{repo}/resolve/main/{f}"
             try:
                 r = requests.get(url, timeout=300,
-                                 headers={"User-Agent": "Manalore/1.0"})
+                                 headers={"User-Agent": "Manalore/1.0",
+                                          **({"Authorization": f"Bearer {token}"} if token else {})})
                 if not r.ok:
                     continue
                 buf = io.BytesIO(r.content)
@@ -1393,7 +1404,7 @@ def score_color(v):
 
 # ---- header ----
 with st.spinner("Opening the library..."):
-    _hf_result = load_full_pool_from_hf(HF_REPO)
+    _hf_result = load_full_pool_from_hf(HF_REPO, HF_TOKEN_VAL)
     if isinstance(_hf_result, tuple):
         _hf_pool, _hf_status = _hf_result
     else:
@@ -1421,7 +1432,7 @@ ML, ML_NAMES = build_ml(_pool_sig, _ml_names, _ml_rows, _ml_prices, _ml_ranks)
 ML_INDEX = {n: i for i, n in enumerate(ML_NAMES)}
 
 # real accumulated price history from Hugging Face, if configured
-HIST = load_price_history(HF_REPO)
+HIST = load_price_history(HF_REPO, HF_TOKEN_VAL)
 
 # time-series forecaster: trains on HF history if enough data exists
 FORECASTER = {"ok": False}
