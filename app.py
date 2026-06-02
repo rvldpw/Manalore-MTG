@@ -121,25 +121,22 @@ def load_library(target=TARGET):
 
 @st.cache_data(show_spinner=False, ttl=1800)
 def load_full_pool_from_hf(repo):
-    """Load the full card library from the most recent full-data snapshot in HF.
-    Uses direct requests download into BytesIO so there are no local-cache permission
-    issues on Streamlit Cloud. Reads only the Parquet schema footer first to identify
-    full snapshots cheaply, then reads the actual data for the right one."""
+    """Load the full card library from HF. Uses direct requests+BytesIO.
+    Returns (cards_list, status_message) so the UI can show what happened."""
     if not repo:
-        return None
+        return None, "no repo configured"
     try:
         import io, json as _json
         import pyarrow.parquet as pq
         from huggingface_hub import HfApi
         api = HfApi()
-        all_files = api.list_repo_files(repo_id=repo, repo_type="dataset")
-        # check library/ (new path) then snapshot_date= (old path), newest first
-        files = sorted([f for f in all_files
-                        if (f.startswith("data/library/") or
-                            f.startswith("data/snapshot_date="))
-                        and f.endswith(".parquet")], reverse=True)
+        all_files = list(api.list_repo_files(repo_id=repo, repo_type="dataset"))
+        files = sorted(
+            [f for f in all_files
+             if f.endswith(".parquet") and "snapshot_date=" in f],
+            reverse=True)
         if not files:
-            return None
+            return None, f"no parquet files found (total repo files: {len(all_files)})"
 
         needed = ["name", "oracle_id", "set", "set_name", "set_type", "released_at",
                   "oracle_text", "type_line", "cmc", "mana_cost", "colors",
@@ -148,55 +145,54 @@ def load_full_pool_from_hf(repo):
                   "foil", "nonfoil", "finishes", "frame_effects", "border_color",
                   "full_art", "promo_types", "layout", "collector_number", "digital"]
 
-        for f in files:
-            url = (f"https://huggingface.co/datasets/{repo}/resolve/main/{f}"
-                   if not f.startswith("http") else f)
+        for f in files[:15]:
+            url = f"https://huggingface.co/datasets/{repo}/resolve/main/{f}"
             try:
                 r = requests.get(url, timeout=300,
                                  headers={"User-Agent": "Manalore/1.0"})
                 if not r.ok:
                     continue
                 buf = io.BytesIO(r.content)
-                # read schema from Parquet footer only (fast, no row data)
                 pf = pq.ParquetFile(buf)
-                col_names = pf.schema_arrow.names
+                # handle different pyarrow versions
+                try:
+                    col_names = list(pf.schema_arrow.names)
+                except AttributeError:
+                    try:
+                        col_names = list(pf.schema.names)
+                    except Exception:
+                        col_names = []
                 if "oracle_text" not in col_names or "type_line" not in col_names:
-                    continue  # slim price-history file, skip it
-                # full snapshot found - read only needed columns
-                buf.seek(0)
+                    continue
+                # found a full snapshot
                 read_cols = [c for c in needed if c in col_names]
                 df = pd.read_parquet(io.BytesIO(r.content), columns=read_cols)
                 if "digital" in df.columns:
                     df = df[df["digital"] != True]
-                json_list_cols = ["colors", "color_identity", "keywords",
-                                  "finishes", "promo_types", "frame_effects"]
-                json_dict_cols = ["prices", "legalities"]
-                for col in json_list_cols:
+                json_list = ["colors","color_identity","keywords",
+                             "finishes","promo_types","frame_effects"]
+                json_dict = ["prices","legalities"]
+                for col in json_list:
                     if col in df.columns:
-                        df[col] = df[col].map(
-                            lambda x: (_json.loads(x) if isinstance(x, str) else x) or [])
-                for col in json_dict_cols:
+                        df[col]=df[col].map(lambda x:(_json.loads(x) if isinstance(x,str) else x) or [])
+                for col in json_dict:
                     if col in df.columns:
-                        df[col] = df[col].map(
-                            lambda x: (_json.loads(x) if isinstance(x, str) else x) or {})
+                        df[col]=df[col].map(lambda x:(_json.loads(x) if isinstance(x,str) else x) or {})
                 seen, cards = {}, []
                 for row in df.to_dict("records"):
-                    if not row.get("name"):
-                        continue
-                    row["image_uris"] = {
-                        "normal": row.pop("img_normal", None),
-                        "art_crop": row.pop("img_art_crop", None),
-                    }
-                    key = row.get("oracle_id") or row.get("name")
+                    if not row.get("name"): continue
+                    row["image_uris"]={
+                        "normal":row.pop("img_normal",None),
+                        "art_crop":row.pop("img_art_crop",None)}
+                    key=row.get("oracle_id") or row.get("name")
                     if key not in seen:
-                        seen[key] = True
-                        cards.append(row)
-                return cards if cards else None
-            except Exception:
+                        seen[key]=True; cards.append(row)
+                return cards, f"loaded {len(cards):,} cards from {f}"
+            except Exception as e:
                 continue
-        return None
-    except Exception:
-        return None
+        return None, f"scanned {min(15,len(files))} files, none had full card data"
+    except Exception as e:
+        return None, f"error: {e}"
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -1397,7 +1393,11 @@ def score_color(v):
 
 # ---- header ----
 with st.spinner("Opening the library..."):
-    _hf_pool = load_full_pool_from_hf(HF_REPO)
+    _hf_result = load_full_pool_from_hf(HF_REPO)
+    if isinstance(_hf_result, tuple):
+        _hf_pool, _hf_status = _hf_result
+    else:
+        _hf_pool, _hf_status = _hf_result, "legacy return"
     if _hf_pool and len(_hf_pool) > TARGET:
         POOL = [c for c in _hf_pool if c.get("name")]
         _pool_source = "hf"
@@ -1437,6 +1437,8 @@ if HIST is not None and len(HIST) >= 80:
 stamp = time.strftime("%I:%M %p").lstrip("0")
 _pool_desc = (f"all {len(POOL):,} known cards" if _pool_source == "hf"
               else f"the {len(POOL):,} most-played cards")
+_hf_note = (f"&nbsp;&nbsp;·&nbsp;&nbsp;<span style='color:#df7261'>HF: {_hf_status}</span>"
+            if _pool_source == "api" and HF_REPO else "")
 st.markdown(
     "<div class='masthead'>"
     "<div class='crest'>✦</div>"
@@ -1446,6 +1448,7 @@ st.markdown(
     f"&nbsp;&nbsp;·&nbsp;&nbsp;tracking {_pool_desc}"
     + (f"&nbsp;&nbsp;·&nbsp;&nbsp;{HIST['snapshot_date'].nunique()} days of price history"
        if (HIST is not None and len(HIST)) else "")
+    + _hf_note
     + "</div>"
     "<div class='mast-divider'></div>"
     "</div>",
