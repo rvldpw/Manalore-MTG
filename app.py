@@ -1463,7 +1463,7 @@ def card_sheet_body(c):
     with left:
         im = img_uri(c, "normal") or img_uri(c, "large")
         if im:
-            st.image(im, use_container_width=True)
+            st.image(im, width='stretch')
         in_basket = c["name"] in [x["name"] for x in SS["basket"]]
         if st.button("✓ In your deck" if in_basket else "＋ Add to deck builder",
                      key=f"dlgadd_{c.get('id', c['name'])}", use_container_width=True,
@@ -1513,7 +1513,7 @@ def card_sheet_body(c):
                           tooltip=[alt.Tooltip("snapshot_date:T", title="Date"),
                                    alt.Tooltip("usd:Q", title="Price", format="$.2f")])
                   .properties(height=190))
-            st.altair_chart(hc, use_container_width=True)
+            st.altair_chart(hc, width='stretch')
         except Exception:
             st.line_chart(hist_df.set_index("snapshot_date")["usd"], color="#d9a850", height=190)
 
@@ -1571,7 +1571,7 @@ def card_sheet_body(c):
                             tooltip=[alt.Tooltip("Label:N", title="When"),
                                      alt.Tooltip(f"{chart_label}:Q", format="$.2f")])
                     .properties(height=200))
-            st.altair_chart(line, use_container_width=True)
+            st.altair_chart(line, width='stretch')
         except Exception:
             st.line_chart(out.set_index("Label")[chart_label], color=chart_color, height=190)
 
@@ -1608,7 +1608,7 @@ def card_sheet_body(c):
         st.markdown(f"<span class='cap'>This card has {len(hist)} printings. "
                     "Newer reprints usually ease supply and soften price.</span>", unsafe_allow_html=True)
         hdf = pd.DataFrame(hist)
-        st.dataframe(hdf, use_container_width=True, hide_index=True, height=min(320, 60 + len(hist) * 35),
+        st.dataframe(hdf, width='stretch', hide_index=True, height=min(320, 60 + len(hist) * 35),
                      column_config={"Price": st.column_config.NumberColumn(format="$%.2f")})
     elif hist:
         st.markdown("<span class='cap'>Only one printing so far, so supply is concentrated in this release.</span>",
@@ -2107,7 +2107,7 @@ with tab_build:
                     bars = base.mark_bar(color=ACCENT, cornerRadius=3).encode(tooltip=["Mana value", "Cards"])
                     labels = base.mark_text(dy=-6, color="#ece6d6", fontSize=11).encode(
                         text=alt.condition("datum.Cards > 0", "Cards:Q", alt.value("")))
-                    st.altair_chart((bars + labels).properties(height=230), use_container_width=True)
+                    st.altair_chart((bars + labels).properties(height=230), width='stretch')
                 with ch2:
                     st.markdown("**Color split**  <span class='cap'>mana symbols in the deck</span>", unsafe_allow_html=True)
                     pip = {"W": 0, "U": 0, "B": 0, "R": 0, "G": 0}
@@ -2130,7 +2130,7 @@ with tab_build:
                 rbase = alt.Chart(rdf).encode(y=alt.Y("Role:N", sort="-x", title=None), x=alt.X("Cards:Q", title="Cards"))
                 rbars = rbase.mark_bar(color="#9a7bc4", cornerRadius=3).encode(tooltip=["Role", "Cards"])
                 rlabels = rbase.mark_text(dx=8, color="#ece6d6", fontSize=11).encode(text="Cards:Q")
-                st.altair_chart((rbars + rlabels).properties(height=220), use_container_width=True)
+                st.altair_chart((rbars + rlabels).properties(height=220), width='stretch')
             except Exception:
                 with ch1:
                     st.markdown("**Mana curve**")
@@ -2250,7 +2250,7 @@ with tab_market:
                                                                 range=["#5fc28a", "#df7261"]), legend=None),
                      tooltip=["Card", "Power", "Demand", alt.Tooltip("Price:Q", format="$.2f"), "Move %"])
                  .properties(height=340))
-        st.altair_chart(chart, use_container_width=True)
+        st.altair_chart(chart, width='stretch')
         st.caption("A log price scale spreads cheap and expensive cards evenly so the pattern is readable.")
     except Exception:
         st.scatter_chart(df, x="Demand", y="Price", height=320)
@@ -2302,13 +2302,13 @@ with tab_market:
     fallers = df.sort_values("Move %").head(8)
     with up_col:
         st.markdown("<span class='cap up'>▲ Projected to rise</span>", unsafe_allow_html=True)
-        st.dataframe(risers[["Card", "Price", "Proj 90d", "Move %"]], use_container_width=True, hide_index=True,
+        st.dataframe(risers[["Card", "Price", "Proj 90d", "Move %"]], width='stretch', hide_index=True,
                      column_config={"Price": st.column_config.NumberColumn(format="$%.2f"),
                                     "Proj 90d": st.column_config.NumberColumn(format="$%.2f"),
                                     "Move %": st.column_config.NumberColumn(format="%+.1f%%")})
     with dn_col:
         st.markdown("<span class='cap dn'>▼ Projected to dip</span>", unsafe_allow_html=True)
-        st.dataframe(fallers[["Card", "Price", "Proj 90d", "Move %"]], use_container_width=True, hide_index=True,
+        st.dataframe(fallers[["Card", "Price", "Proj 90d", "Move %"]], width='stretch', hide_index=True,
                      column_config={"Price": st.column_config.NumberColumn(format="$%.2f"),
                                     "Proj 90d": st.column_config.NumberColumn(format="$%.2f"),
                                     "Move %": st.column_config.NumberColumn(format="%+.1f%%")})
@@ -2317,7 +2317,7 @@ with tab_market:
     st.markdown("#### Full valuation table")
     st.markdown("<span class='cap'>Sort any column. Power and demand are model scores; price is the live market value.</span>",
                 unsafe_allow_html=True)
-    st.dataframe(df.sort_values("Power", ascending=False), use_container_width=True, hide_index=True, height=440,
+    st.dataframe(df.sort_values("Power", ascending=False), width='stretch', hide_index=True, height=440,
                  column_config={"Price": st.column_config.NumberColumn(format="$%.2f"),
                                 "Proj 90d": st.column_config.NumberColumn(format="$%.2f"),
                                 "Move %": st.column_config.NumberColumn(format="%+.1f%%"),
@@ -2391,7 +2391,7 @@ with tab_academy:
                 x=alt.X("Importance:Q", title="Feature importance"),
                 tooltip=["Feature", alt.Tooltip("Importance:Q", format=".3f")]
             ).properties(height=340)
-            st.altair_chart(fbar, use_container_width=True)
+            st.altair_chart(fbar, width='stretch')
         except Exception:
             pass
 
