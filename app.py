@@ -46,45 +46,45 @@ except Exception:
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def load_price_history(repo, token=None, max_snapshots=120):
-    """Load accumulated daily price snapshots from the Hugging Face dataset."""
+def load_price_history(repo, token=None, max_snapshots=90):
+    """Load slim price history from HF by trying recent dates directly.
+    Bypasses list_repo_files() - accesses files by known date pattern."""
     if not repo:
         return None
     try:
-        from huggingface_hub import HfApi
-        import json as _json
-        api = HfApi(token=token)
-        files = api.list_repo_files(repo_id=repo, repo_type="dataset")
-        parts = sorted([f for f in files if f.startswith("data/prices/snapshot_date=") and f.endswith(".parquet")])
-        if not parts:
-            # fall back to old path structure
-            parts = sorted([f for f in files if f.startswith("data/snapshot_date=") and f.endswith(".parquet")])
-        parts = parts[-max_snapshots:]
-        if not parts:
-            return None
+        import io, json as _json, datetime
+        hdrs = {"User-Agent": "Manalore/1.0"}
+        if token:
+            hdrs["Authorization"] = f"Bearer {token}"
         frames = []
-        hdrs = {"User-Agent": "Manalore/1.0",
-                **({"Authorization": f"Bearer {token}"} if token else {})}
-        for p in parts:
-            url = f"https://huggingface.co/datasets/{repo}/resolve/main/{p}"
-            try:
-                import io
-                r = requests.get(url, timeout=120, headers=hdrs)
-                if not r.ok:
-                    continue
-                df = pd.read_parquet(io.BytesIO(r.content),
-                                     columns=["snapshot_date", "name", "set", "prices"])
-            except Exception:
-                continue
-            def _usd(x):
+        today = datetime.date.today()
+        for days_back in range(max_snapshots):
+            date_str = (today - datetime.timedelta(days=days_back)).isoformat()
+            # try prices/ path first, then old snapshot_date= path
+            for path in [f"data/prices/snapshot_date={date_str}/cards.parquet",
+                         f"data/snapshot_date={date_str}/cards.parquet"]:
+                url = f"https://huggingface.co/datasets/{repo}/resolve/main/{path}"
                 try:
-                    d = _json.loads(x) if isinstance(x, str) else (x or {})
-                    v = d.get("usd") or d.get("usd_foil")
-                    return float(v) if v else None
+                    r = requests.get(url, timeout=60, headers=hdrs)
+                    if not r.ok:
+                        continue
+                    df = pd.read_parquet(io.BytesIO(r.content))
+                    if "prices" not in df.columns:
+                        continue
+                    def _usd(x):
+                        try:
+                            d = _json.loads(x) if isinstance(x, str) else (x or {})
+                            v = d.get("usd") or d.get("usd_foil")
+                            return float(v) if v else None
+                        except Exception:
+                            return None
+                    df["usd"] = df["prices"].map(_usd)
+                    if "snapshot_date" not in df.columns:
+                        df["snapshot_date"] = date_str
+                    frames.append(df[["snapshot_date","name","set","usd"]])
+                    break  # got this date, move on
                 except Exception:
-                    return None
-            df["usd"] = df["prices"].map(_usd)
-            frames.append(df[["snapshot_date", "name", "set", "usd"]])
+                    continue
         if not frames:
             return None
         hist = pd.concat(frames, ignore_index=True)
@@ -131,22 +131,18 @@ def load_library(target=TARGET):
 
 @st.cache_data(show_spinner=False, ttl=1800)
 def load_full_pool_from_hf(repo, token=None):
-    """Load the full card library from HF. Uses direct requests+BytesIO.
-    Returns (cards_list, status_message) so the UI can show what happened."""
+    """Load the full card library from HF by trying recent dates directly.
+    Bypasses list_repo_files() entirely - accesses files by known date pattern.
+    Returns (cards_list, status_message)."""
     if not repo:
         return None, "no repo configured"
     try:
-        import io, json as _json
+        import io, json as _json, datetime
         import pyarrow.parquet as pq
-        from huggingface_hub import HfApi
-        api = HfApi(token=token)
-        all_files = list(api.list_repo_files(repo_id=repo, repo_type="dataset"))
-        files = sorted(
-            [f for f in all_files
-             if f.endswith(".parquet") and "snapshot_date=" in f],
-            reverse=True)
-        if not files:
-            return None, f"no parquet files found (total repo files: {len(all_files)})"
+
+        hdrs = {"User-Agent": "Manalore/1.0"}
+        if token:
+            hdrs["Authorization"] = f"Bearer {token}"
 
         needed = ["name", "oracle_id", "set", "set_name", "set_type", "released_at",
                   "oracle_text", "type_line", "cmc", "mana_cost", "colors",
@@ -155,53 +151,59 @@ def load_full_pool_from_hf(repo, token=None):
                   "foil", "nonfoil", "finishes", "frame_effects", "border_color",
                   "full_art", "promo_types", "layout", "collector_number", "digital"]
 
-        for f in files[:15]:
-            url = f"https://huggingface.co/datasets/{repo}/resolve/main/{f}"
-            try:
-                r = requests.get(url, timeout=300,
-                                 headers={"User-Agent": "Manalore/1.0",
-                                          **({"Authorization": f"Bearer {token}"} if token else {})})
-                if not r.ok:
-                    continue
-                buf = io.BytesIO(r.content)
-                pf = pq.ParquetFile(buf)
-                # handle different pyarrow versions
+        today = datetime.date.today()
+        # try last 30 days, checking both data/library/ and data/snapshot_date= paths
+        for days_back in range(30):
+            date_str = (today - datetime.timedelta(days=days_back)).isoformat()
+            paths_to_try = [
+                f"data/library/snapshot_date={date_str}/cards.parquet",
+                f"data/snapshot_date={date_str}/cards.parquet",
+            ]
+            for path in paths_to_try:
+                url = f"https://huggingface.co/datasets/{repo}/resolve/main/{path}"
                 try:
-                    col_names = list(pf.schema_arrow.names)
-                except AttributeError:
+                    r = requests.get(url, timeout=300, headers=hdrs)
+                    if not r.ok:
+                        continue
+                    buf = io.BytesIO(r.content)
+                    pf = pq.ParquetFile(buf)
                     try:
+                        col_names = list(pf.schema_arrow.names)
+                    except AttributeError:
                         col_names = list(pf.schema.names)
-                    except Exception:
-                        col_names = []
-                if "oracle_text" not in col_names or "type_line" not in col_names:
+                    if "oracle_text" not in col_names or "type_line" not in col_names:
+                        continue
+                    # full snapshot found
+                    read_cols = [c for c in needed if c in col_names]
+                    df = pd.read_parquet(io.BytesIO(r.content), columns=read_cols)
+                    if "digital" in df.columns:
+                        df = df[df["digital"] != True]
+                    json_list = ["colors","color_identity","keywords",
+                                 "finishes","promo_types","frame_effects"]
+                    json_dict = ["prices","legalities"]
+                    for col in json_list:
+                        if col in df.columns:
+                            df[col] = df[col].map(
+                                lambda x: (_json.loads(x) if isinstance(x, str) else x) or [])
+                    for col in json_dict:
+                        if col in df.columns:
+                            df[col] = df[col].map(
+                                lambda x: (_json.loads(x) if isinstance(x, str) else x) or {})
+                    seen, cards = {}, []
+                    for row in df.to_dict("records"):
+                        if not row.get("name"):
+                            continue
+                        row["image_uris"] = {
+                            "normal": row.pop("img_normal", None),
+                            "art_crop": row.pop("img_art_crop", None)}
+                        key = row.get("oracle_id") or row.get("name")
+                        if key not in seen:
+                            seen[key] = True
+                            cards.append(row)
+                    return cards, f"loaded {len(cards):,} cards from {path}"
+                except Exception as e:
                     continue
-                # found a full snapshot
-                read_cols = [c for c in needed if c in col_names]
-                df = pd.read_parquet(io.BytesIO(r.content), columns=read_cols)
-                if "digital" in df.columns:
-                    df = df[df["digital"] != True]
-                json_list = ["colors","color_identity","keywords",
-                             "finishes","promo_types","frame_effects"]
-                json_dict = ["prices","legalities"]
-                for col in json_list:
-                    if col in df.columns:
-                        df[col]=df[col].map(lambda x:(_json.loads(x) if isinstance(x,str) else x) or [])
-                for col in json_dict:
-                    if col in df.columns:
-                        df[col]=df[col].map(lambda x:(_json.loads(x) if isinstance(x,str) else x) or {})
-                seen, cards = {}, []
-                for row in df.to_dict("records"):
-                    if not row.get("name"): continue
-                    row["image_uris"]={
-                        "normal":row.pop("img_normal",None),
-                        "art_crop":row.pop("img_art_crop",None)}
-                    key=row.get("oracle_id") or row.get("name")
-                    if key not in seen:
-                        seen[key]=True; cards.append(row)
-                return cards, f"loaded {len(cards):,} cards from {f}"
-            except Exception as e:
-                continue
-        return None, f"scanned {min(15,len(files))} files, none had full card data"
+        return None, "no full snapshot found in last 30 days"
     except Exception as e:
         return None, f"error: {e}"
 
