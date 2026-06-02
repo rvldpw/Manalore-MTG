@@ -116,7 +116,7 @@ def main():
     existing = set()
     try:
         for f in api.list_repo_files(repo_id=repo, repo_type="dataset"):
-            if f.startswith("data/snapshot_date=") and f.endswith(".parquet"):
+            if f.startswith("data/prices/snapshot_date=") and f.endswith(".parquet"):
                 existing.add(f.split("snapshot_date=")[1].split("/")[0])
     except Exception:
         pass
@@ -161,7 +161,7 @@ def main():
         out_path = os.path.join("hf_import", "cards.parquet")
         df.to_parquet(out_path, compression="zstd", index=False)
         api.upload_file(path_or_fileobj=out_path,
-                        path_in_repo=f"data/snapshot_date={date}/cards.parquet",
+                        path_in_repo=f"data/prices/snapshot_date={date}/cards.parquet",
                         repo_id=repo, repo_type="dataset",
                         commit_message=f"Historical seed {date} ({len(df)} cards)")
         uploaded += 1
