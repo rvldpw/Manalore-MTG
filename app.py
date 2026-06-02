@@ -697,6 +697,8 @@ def train_models(_pool_sig, rows, prices, ranks):
         return out
 
     X = np.array([[r[k] for k in ML_FEATURE_ORDER] for r in rows], dtype=float)
+    # clean NaN/inf from feature matrix - HF parquet can deliver NaN for cmc etc.
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     n_total = len(X)
 
     # ---- price model ----
@@ -704,6 +706,7 @@ def train_models(_pool_sig, rows, prices, ranks):
     if len(price_idx) >= 150:
         Xp = X[price_idx]
         yp = np.log1p(np.array([prices[i] for i in price_idx], dtype=float))
+        yp = np.nan_to_num(yp, nan=0.0, posinf=0.0, neginf=0.0)
         price_model = HistGradientBoostingRegressor(
             max_depth=5, max_iter=300, learning_rate=0.05,
             l2_regularization=0.8, min_samples_leaf=15, random_state=7)
@@ -729,6 +732,7 @@ def train_models(_pool_sig, rows, prices, ranks):
     inv_rank = 10 - np.clip(np.log10(np.array(ranks, dtype=float) + 1) * 2.05, 0, 10)
     breadth = np.clip(np.array([r["n_formats"] for r in rows]) * 1.55, 0, 10)
     y_imp = np.clip((0.7 * inv_rank + 0.3 * breadth) / 10 * 100, 0, 100)
+    y_imp = np.nan_to_num(y_imp, nan=50.0)  # replace any NaN with neutral midpoint
     imp_model = HistGradientBoostingRegressor(
         max_depth=4, max_iter=260, learning_rate=0.05,
         l2_regularization=0.5, min_samples_leaf=12, random_state=7)
@@ -1449,7 +1453,16 @@ for _c in POOL:
 _ml_names = [c["name"] for c in POOL]
 _ml_rows = [ml_feature_row(c) for c in POOL]
 _ml_prices = [price_now(c) for c in POOL]
-_ml_ranks = [c.get("edhrec_rank") or 60000 for c in POOL]
+
+def _safe_rank(c):
+    r = c.get("edhrec_rank")
+    try:
+        r = float(r)
+        return r if (r == r and r > 0) else 60000
+    except (TypeError, ValueError):
+        return 60000
+
+_ml_ranks = [_safe_rank(c) for c in POOL]
 _pool_sig = f"{len(POOL)}-{_ml_names[0] if _ml_names else ''}-{_ml_names[-1] if _ml_names else ''}"
 ML, ML_NAMES = build_ml(_pool_sig, _ml_names, _ml_rows, _ml_prices, _ml_ranks)
 ML_INDEX = {n: i for i, n in enumerate(ML_NAMES)}
