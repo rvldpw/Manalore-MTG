@@ -32,6 +32,67 @@ HEADERS = {"User-Agent": "Manalore/1.0", "Accept": "application/json"}
 FMTS = ["standard", "pioneer", "modern", "legacy", "vintage", "commander", "pauper"]
 TARGET = 2500
 
+# Hugging Face history dataset (built by collector.py via a daily GitHub Action).
+# Set HF_DATASET_REPO in Streamlit secrets to enable real price history + forecasting.
+# Reads are public for a public dataset; no token needed to read.
+HF_REPO = None
+try:
+    HF_REPO = st.secrets.get("HF_DATASET_REPO")  # e.g. "you/manalore-mtg-history"
+except Exception:
+    HF_REPO = None
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_price_history(repo, max_snapshots=120):
+    """Load accumulated daily price snapshots from the Hugging Face dataset.
+    Returns a tidy DataFrame [snapshot_date, name, set, usd] or None if unavailable.
+    Reads only the slim columns needed, across available dated partitions."""
+    if not repo:
+        return None
+    try:
+        from huggingface_hub import HfApi
+        import json as _json
+        api = HfApi()
+        files = api.list_repo_files(repo_id=repo, repo_type="dataset")
+        parts = sorted([f for f in files if f.startswith("data/snapshot_date=") and f.endswith(".parquet")])
+        parts = parts[-max_snapshots:]
+        if not parts:
+            return None
+        frames = []
+        for p in parts:
+            url = f"https://huggingface.co/datasets/{repo}/resolve/main/{p}"
+            try:
+                # read only the columns we need to keep it light
+                df = pd.read_parquet(url, columns=["snapshot_date", "name", "set", "prices"])
+            except Exception:
+                df = pd.read_parquet(url)
+            # extract usd from the JSON-encoded prices field
+            def _usd(x):
+                try:
+                    d = _json.loads(x) if isinstance(x, str) else (x or {})
+                    v = d.get("usd") or d.get("usd_foil")
+                    return float(v) if v else None
+                except Exception:
+                    return None
+            df["usd"] = df["prices"].map(_usd)
+            frames.append(df[["snapshot_date", "name", "set", "usd"]])
+        hist = pd.concat(frames, ignore_index=True)
+        hist = hist.dropna(subset=["usd"])
+        return hist
+    except Exception:
+        return None
+
+
+def card_history(hist, name):
+    """Time-series of one card's price, sorted by date. Empty frame if none."""
+    if hist is None:
+        return pd.DataFrame(columns=["snapshot_date", "usd"])
+    h = hist[hist["name"] == name][["snapshot_date", "usd"]].copy()
+    if h.empty:
+        return h
+    h = h.groupby("snapshot_date", as_index=False)["usd"].mean().sort_values("snapshot_date")
+    return h
+
 # ----------------------------------------------------------------------------
 # DATA LAYER
 # ----------------------------------------------------------------------------
@@ -550,6 +611,37 @@ def ml_similar(models, names, idx, k=8):
     return [int(j) for j in ind[0] if int(j) != idx][:k]
 
 
+def ml_vector(models, c):
+    """Standardized ML feature vector for any card (works for cards outside POOL)."""
+    if not models.get("ok") or "scaler" not in models:
+        return None
+    x = np.array([[ml_feature_row(c)[k] for k in ML_FEATURE_ORDER]], dtype=float)
+    return models["scaler"].transform(x)[0]
+
+
+def ml_anchor_centroid(models, anchors):
+    """Average standardized vector of the anchor cards, the deck's 'fingerprint'."""
+    vecs = [ml_vector(models, a) for a in anchors]
+    vecs = [v for v in vecs if v is not None]
+    if not vecs:
+        return None
+    return np.mean(vecs, axis=0)
+
+
+def ml_synergy_to(models, centroid, c):
+    """Cosine similarity (0-1) of a card to the deck centroid. 0.5 if unavailable."""
+    if centroid is None:
+        return 0.5
+    v = ml_vector(models, c)
+    if v is None:
+        return 0.5
+    denom = (np.linalg.norm(centroid) * np.linalg.norm(v))
+    if denom == 0:
+        return 0.5
+    cos = float(np.dot(centroid, v) / denom)
+    return (cos + 1) / 2  # map [-1,1] to [0,1]
+
+
 def tier_word(im):
     return "a cornerstone" if im >= 80 else "a staple" if im >= 65 else "a solid role-player" if im >= 50 else "a niche pick"
 
@@ -654,19 +746,30 @@ def role_targets(strategy, spell_slots):
     return {r: max(1, round(frac * spell_slots)) for r, frac in prof["roles"].items()}
 
 
-def synergy_score(cards, strategy):
-    """0-100. Rewards cards whose role fits the strategy profile and shared colors."""
+def synergy_score(cards, strategy, models=None):
+    """0-100. Rewards cards whose role fits the strategy and shared colors, and (when the ML
+    model is available) how tightly the deck clusters in learned feature space."""
     if not cards:
         return 0
     prof = STRAT_PROFILE.get(strategy, STRAT_PROFILE["Midrange"])
     wanted = set(prof["roles"].keys())
     on_plan = sum(1 for c in cards if (("Other" if role(c) == "Spell" else role(c)) in wanted or "land" in type_line(c).lower()))
     on_plan_frac = on_plan / len(cards)
-    # color cohesion: fewer distinct colors among nonland cards is tighter
     cols = set()
     for c in cards:
         cols.update(c.get("color_identity", []))
     cohesion = 1.0 if len(cols) <= 2 else 0.85 if len(cols) == 3 else 0.65 if len(cols) == 4 else 0.5
+    # ML cohesion: average similarity of each nonland card to the deck centroid
+    ml_cohesion = None
+    if models and models.get("ok") and "scaler" in models:
+        nonland = [c for c in cards if "land" not in type_line(c).lower()]
+        cen = ml_anchor_centroid(models, nonland)
+        if cen is not None and nonland:
+            sims = [ml_synergy_to(models, cen, c) for c in nonland]
+            ml_cohesion = float(np.mean(sims))
+    if ml_cohesion is not None:
+        # blend: role fit, color cohesion, and learned feature cohesion
+        return round(clamp(on_plan_frac * 50 + cohesion * 18 + ml_cohesion * 32, 0, 100))
     return round(clamp(on_plan_frac * 78 + cohesion * 22, 0, 100))
 
 
@@ -733,8 +836,8 @@ def win_condition(cards, strategy):
     return f"Win by trading efficiently, then taking over with stronger midrange threats like {top or 'your best creatures'}."
 
 
-def deck_quality(cards, strategy, deck_size, value, brief_match):
-    syn = synergy_score(cards, strategy)
+def deck_quality(cards, strategy, deck_size, value, brief_match, models=None):
+    syn = synergy_score(cards, strategy, models)
     con = consistency_score(cards, strategy, deck_size)
     avg_imp = np.mean([importance(c) for c in cards]) if cards else 0
     # budget efficiency: power per dollar, normalized
@@ -792,26 +895,43 @@ def deck_report_txt(name, brief, q, used, lands, value, cols, strategy, deck_siz
     return "\n".join(lines)
 
 
-def assemble_deck(starters, candidates, strategy, deck_size):
-    """Synergy-first build: fill role quotas from the candidate pool, then top up.
-    For 60-card decks, run impactful nonland spells as playsets (multiples) for consistency."""
+def assemble_deck(starters, candidates, strategy, deck_size, models=None):
+    """ML-driven synergy build: fill role quotas, but rank candidates within each role by a
+    blend of learned power and cosine similarity to the deck's evolving fingerprint, so the
+    deck coheres around the build-around cards instead of being unrelated good cards.
+    For 60-card decks, run impactful nonland spells as playsets for consistency."""
     lands = deck_lands(strategy, deck_size)
     spell_slots = deck_size - lands
     targets = role_targets(strategy, spell_slots)
 
-    # bucket candidates by role, best first
+    use_ml = bool(models and models.get("ok") and "scaler" in models)
+
+    # bucket candidates by role
     buckets = {}
     for c in candidates:
-        r = "Other" if role(c) == "Spell" else role(c)
         if "land" in type_line(c).lower():
             continue
+        r = "Other" if role(c) == "Spell" else role(c)
         buckets.setdefault(r, []).append(c)
-    for r in buckets:
-        buckets[r].sort(key=lambda c: -importance(c))
 
     used, used_names = [], set()
 
+    # the deck "fingerprint" starts from the seed cards and updates as we add
+    anchors = [s for s in starters]
+    centroid = ml_anchor_centroid(models, anchors) if use_ml else None
+
+    def rank(pool):
+        """Order a role's candidates by 65% power + 35% synergy to current centroid."""
+        if not use_ml or centroid is None:
+            return sorted(pool, key=lambda c: -importance(c))
+        def score(c):
+            powr = importance(c) / 100.0
+            syn = ml_synergy_to(models, centroid, c)
+            return -(0.62 * powr + 0.38 * syn)
+        return sorted(pool, key=score)
+
     def add(card, copies):
+        nonlocal centroid
         if card["name"] in used_names or "land" in type_line(card).lower():
             return 0
         copies = max(1, min(copies, (4 if deck_size < 100 else 1)))
@@ -821,31 +941,36 @@ def assemble_deck(starters, candidates, strategy, deck_size):
                 break
             used.append(card); added += 1
         used_names.add(card["name"])
+        # update the fingerprint with each distinct card so the deck stays cohesive
+        if use_ml and added:
+            anchors.append(card)
+            centroid = ml_anchor_centroid(models, anchors)
         return added
 
-    # 1) seed the user's build-around/favourite cards first
+    # 1) seed the user's build-around / favourite cards first
     for c in starters:
         add(c, 4 if deck_size < 100 else 1)
 
-    # 2) fill each role toward its target, using multiples in 60-card decks
+    # 2) fill each role toward its target, re-ranking by synergy as the deck grows
     per_copy = 3 if deck_size < 100 else 1
     for r, want in sorted(targets.items(), key=lambda kv: -kv[1]):
         have = sum(1 for c in used if ("Other" if role(c) == "Spell" else role(c)) == r)
-        pool = buckets.get(r, [])
-        i = 0
-        while have < want and i < len(pool) and len(used) < spell_slots:
-            got = add(pool[i], per_copy)
+        guard = 0
+        while have < want and len(used) < spell_slots and guard < 200:
+            guard += 1
+            pool = [c for c in buckets.get(r, []) if c["name"] not in used_names]
+            if not pool:
+                break
+            best = rank(pool)[0]
+            got = add(best, per_copy)
             have += got
-            i += 1
 
-    # 3) top up any remaining slots with the best on-plan cards left
-    leftovers = sorted(
-        [c for r in targets for c in buckets.get(r, [])] + [c for c in candidates if "land" not in type_line(c).lower()],
-        key=lambda c: -importance(c))
-    for c in leftovers:
-        if len(used) >= spell_slots:
+    # 3) top up remaining slots with the best on-plan, on-synergy cards left
+    while len(used) < spell_slots:
+        pool = [c for r in buckets for c in buckets[r] if c["name"] not in used_names]
+        if not pool:
             break
-        add(c, 1)
+        add(rank(pool)[0], 1)
 
     return used, lands, spell_slots, targets
 
@@ -1029,6 +1154,9 @@ _pool_sig = f"{len(POOL)}-{_ml_names[0] if _ml_names else ''}-{_ml_names[-1] if 
 ML, ML_NAMES = build_ml(_pool_sig, _ml_names, _ml_rows, _ml_prices, _ml_ranks)
 ML_INDEX = {n: i for i, n in enumerate(ML_NAMES)}
 
+# real accumulated price history from Hugging Face, if configured
+HIST = load_price_history(HF_REPO)
+
 stamp = time.strftime("%I:%M %p").lstrip("0")
 st.markdown(
     "<div class='masthead'>"
@@ -1036,7 +1164,10 @@ st.markdown(
     "<div class='wordmark'>MANALORE</div>"
     "<div class='subtitle'>ACADEMY OF CARD MASTERY</div>"
     f"<div class='statusbar'><span class='dot'>●</span> Live market data, updated {stamp}"
-    f"&nbsp;&nbsp;·&nbsp;&nbsp;tracking the {len(POOL):,} most-played cards</div>"
+    f"&nbsp;&nbsp;·&nbsp;&nbsp;tracking the {len(POOL):,} most-played cards"
+    + (f"&nbsp;&nbsp;·&nbsp;&nbsp;{HIST['snapshot_date'].nunique()} days of price history"
+       if (HIST is not None and len(HIST)) else "")
+    + "</div>"
     "<div class='mast-divider'></div>"
     "</div>",
     unsafe_allow_html=True)
@@ -1105,6 +1236,26 @@ def card_sheet_body(c):
         fmts = legal_formats(c)
         st.markdown("<span class='cap'>LEGAL: " + (", ".join(f.title() for f in fmts) if fmts else "Limited")
                     + "</span>", unsafe_allow_html=True)
+
+    # ---- real price history (from Hugging Face), if we have enough points ----
+    hist_df = card_history(HIST, c["name"]) if HIST is not None else None
+    if hist_df is not None and len(hist_df) >= 3:
+        first, last = hist_df["usd"].iloc[0], hist_df["usd"].iloc[-1]
+        chg = (last - first) / first * 100 if first else 0
+        st.markdown("**Real price history**  "
+                    f"<span class='cap'>{len(hist_df)} daily snapshots · "
+                    f"{'up' if chg>=0 else 'down'} {abs(chg):.0f}% over the period</span>", unsafe_allow_html=True)
+        try:
+            import altair as alt
+            hc = (alt.Chart(hist_df).mark_line(color="#d9a850", strokeWidth=2)
+                  .encode(x=alt.X("snapshot_date:T", title=None),
+                          y=alt.Y("usd:Q", title="USD"),
+                          tooltip=[alt.Tooltip("snapshot_date:T", title="Date"),
+                                   alt.Tooltip("usd:Q", title="Price", format="$.2f")])
+                  .properties(height=190))
+            st.altair_chart(hc, use_container_width=True)
+        except Exception:
+            st.line_chart(hist_df.set_index("snapshot_date")["usd"], color="#d9a850", height=190)
 
     if p:
         st.markdown("**Price outlook · next 90 days**  "
@@ -1555,9 +1706,9 @@ with tab_build:
                 cs.update(c.get("color_identity", []))
             cols = [x for x in ["W", "U", "B", "R", "G"] if x in cs]
         colors_key = "".join(sorted(cols))
-        with st.spinner(f"Searching all of Magic for synergistic {strategy.lower()} cards..."):
+        with st.spinner(f"Searching all of Magic, then using the synergy model to assemble a {strategy.lower()} deck..."):
             candidates = [enrich_card(c) for c in build_candidate_pool(colors_key, strategy, fmt, purpose)]
-            used, lands, spell_slots2, targets = assemble_deck(starters, candidates, strategy, deck_size)
+            used, lands, spell_slots2, targets = assemble_deck(starters, candidates, strategy, deck_size, models=ML)
             if len(used) < spell_slots2:  # top-up from library if the search was thin
                 names = {c["name"] for c in used}
                 for c in sorted(POOL, key=lambda c: -importance(c)):
@@ -1595,13 +1746,14 @@ with tab_build:
             rc = Counter(("Other" if role(c) == "Spell" else role(c)) for c in used)
             covered = sum(1 for r in targets if rc.get(r, 0) >= max(1, int(targets[r] * 0.5)))
             brief_match = clamp(covered / max(1, len(targets)) * 100, 0, 100)
-            q = deck_quality(used, strategy, deck_size, value, brief_match)
+            q = deck_quality(used, strategy, deck_size, value, brief_match, models=ML)
 
             st.markdown(f"## {name}")
             seed_txt = f"built around {bd['seed_name']}, " if bd.get("seed_name") else ""
             fav_txt = f"your {bd['fav_n']} favourite(s), " if bd.get("fav_n") else ""
+            ml_txt = "the synergy model picked cards that cluster around your build, then " if (ML.get("ok") and "scaler" in ML) else ""
             st.markdown(f"<span class='cap'>A {purpose.lower()} {strategy.lower()} {fmt} deck, {seed_txt}{fav_txt}"
-                        f"assembled from across all of Magic and tuned to {guild_name(cols)}. "
+                        f"assembled from across all of Magic: {ml_txt}tuned to {guild_name(cols)}. "
                         f"{STRAT_PROFILE.get(strategy, {}).get('tagline','')}.</span>", unsafe_allow_html=True)
 
             # ---- quality scorecard ----
@@ -1615,8 +1767,10 @@ with tab_build:
             qc[5].metric("Brief match", q["alignment"])
             grade = ("Tournament-ready" if q["overall"] >= 78 else "Strong casual" if q["overall"] >= 64
                      else "Fun, needs tuning" if q["overall"] >= 50 else "Rough draft")
+            syn_note = (" Synergy uses the ML model's measure of how tightly the cards cluster together."
+                        if (ML.get("ok") and "scaler" in ML) else "")
             st.markdown(f"<span class='cap'>Verdict: <b class='gold'>{grade}</b>. "
-                        f"Scores blend synergy, consistency, power, budget efficiency and how well the deck matches your brief.</span>",
+                        f"Scores blend synergy, consistency, power, budget efficiency and brief match.{syn_note}</span>",
                         unsafe_allow_html=True)
 
             mm1, mm2, mm3, mm4 = st.columns(4)
@@ -1910,8 +2064,11 @@ with tab_academy:
              "history collected over time. The transparent scores remain as a fallback for cards the models "
              "have not seen.")
     st.markdown("#### How the builder works")
-    st.write("Pick a pool, choose the cards you like, and the builder keeps your picks, then completes the deck "
-             "with the highest-power cards that fit your colors, fits a curve, and names the deck. You get a real "
-             "skeleton to build on, not a random pile.")
+    st.write("Give the brief and optionally seed a few cards. The builder searches across all of Magic, "
+             "then the similarity model ranks candidates by a blend of learned power and how closely each "
+             "card matches the deck's evolving fingerprint, the average feature vector of the cards already "
+             "chosen. It fills the strategy's role targets card by card, re-scoring synergy as the deck grows, "
+             "so the result coheres around your build-around cards instead of being a pile of unrelated good cards. "
+             "A validation step then checks the finished deck against your brief.")
     st.caption("Prices are aggregated market values for study, not a brokerage quote, and outlooks are not "
                "financial advice. The math is kept transparent so the logic stays auditable. Data refreshes when the page loads.")
