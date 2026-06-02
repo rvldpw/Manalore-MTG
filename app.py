@@ -1440,7 +1440,17 @@ with st.spinner("Opening the library..."):
     else:
         _hf_pool, _hf_status = _hf_result, "legacy return"
     if _hf_pool and len(_hf_pool) > TARGET:
-        POOL = [c for c in _hf_pool if c.get("name")]
+        # Sort by play-rate (edhrec_rank ascending = most played first)
+        # Cap at 10,000 so the app stays fast; full data remains in HF for history/ML
+        HF_POOL_LIMIT = 10000
+        def _rank_key(c):
+            try:
+                r = float(c.get("edhrec_rank") or 99999)
+                return r if r == r else 99999
+            except (TypeError, ValueError):
+                return 99999
+        _hf_pool_sorted = sorted(_hf_pool, key=_rank_key)[:HF_POOL_LIMIT]
+        POOL = [c for c in _hf_pool_sorted if c.get("name")]
         _pool_source = "hf"
     else:
         POOL = [c for c in load_library() if c.get("name")]
@@ -1485,7 +1495,7 @@ if HIST is not None and len(HIST) >= 80:
     FORECASTER = train_forecaster(_hist_sig, _hist_rows_compact, _attr_by_name)
 
 stamp = time.strftime("%I:%M %p").lstrip("0")
-_pool_desc = (f"all {len(POOL):,} known cards" if _pool_source == "hf"
+_pool_desc = (f"the {len(POOL):,} most-played cards (from full database)" if _pool_source == "hf"
               else f"the {len(POOL):,} most-played cards")
 _hf_note = (f"&nbsp;&nbsp;·&nbsp;&nbsp;<span style='color:#df7261'>HF: {_hf_status}</span>"
             if _pool_source == "api" and HF_REPO else "")
@@ -1756,7 +1766,7 @@ def card_tiles(cards, where, cols_n=5, limit=40):
 # LIBRARY
 # ============================================================================
 with tab_lib:
-    _lib_desc = (f"Every known Magic card ({len(POOL):,} unique cards) from all sets and all time, "
+    _lib_desc = (f"The {len(POOL):,} most-played cards drawn from the full Magic database, "
                  if _pool_source == "hf" else
                  f"The {len(POOL):,} most-played cards, ")
     st.markdown(f"<div class='hero'><h2>Read any card like a master.</h2>"
