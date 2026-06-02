@@ -465,8 +465,19 @@ def primary_type(c):
 # ----------------------------------------------------------------------------
 def features(c):
     t, tl = oracle(c), type_line(c).lower()
-    cmc = c.get("cmc", 0) or 0
-    rank = c.get("edhrec_rank") or 45000
+    # safe numeric conversion - HF parquet can deliver NaN, None, or string
+    try:
+        cmc = float(c.get("cmc") or 0)
+        if cmc != cmc: cmc = 0.0  # NaN guard
+    except (TypeError, ValueError):
+        cmc = 0.0
+    try:
+        rank = int(float(c.get("edhrec_rank") or 45000))
+        if rank != rank or rank <= 0: rank = 45000
+    except (TypeError, ValueError):
+        rank = 45000
+    ci = c.get("color_identity") or []
+    if not isinstance(ci, list): ci = []
     play_rank = clamp(10 - math.log10(rank + 1) * 2.05, 0, 10)
     ubiq = clamp(len(legal_formats(c)) * 1.55, 0, 10)
     kw = clamp(len(c.get("keywords", [])) * 1.6 + (2 if re.search(r"modal|choose one|escape|flashback", t) else 0), 0, 10)
@@ -479,7 +490,6 @@ def features(c):
     if re.search(r"create .*token", t): card_adv += 2
     if re.search(r"whenever .* dies|whenever .* enters", t): card_adv += 2
     card_adv = clamp(card_adv, 0, 10)
-    ci = c.get("color_identity", [])
     flex = clamp(4 + (2 - len(ci)) + (2 if "instant" in tl else 0) + (2 if re.search(r"any (color|type)|choose|modal", t) else 0), 0, 10)
     tempo = clamp((3 if re.search(r"haste|flash|flying|prowess", t) else 0) + (10 - cmc) * 0.55 + (1.5 if "creature" in tl else 0), 0, 10)
     return dict(play_rank=play_rank, ubiq=ubiq, kw=kw, eff=eff, card_adv=card_adv, flex=flex, tempo=tempo, cmc=cmc, rank=rank)
@@ -590,9 +600,20 @@ ML_TEXT_SIGNALS = [
 def ml_feature_row(c):
     tl = type_line(c).lower()
     t = oracle(c)
-    cmc = float(c.get("cmc", 0) or 0)
-    ci = c.get("color_identity", [])
-    rank = c.get("edhrec_rank") or 60000
+    try:
+        cmc = float(c.get("cmc") or 0)
+        if cmc != cmc: cmc = 0.0
+    except (TypeError, ValueError):
+        cmc = 0.0
+    ci = c.get("color_identity") or []
+    if not isinstance(ci, list): ci = []
+    try:
+        rank = int(float(c.get("edhrec_rank") or 60000))
+        if rank <= 0 or rank != rank: rank = 60000
+    except (TypeError, ValueError):
+        rank = 60000
+    kws = c.get("keywords") or []
+    if not isinstance(kws, list): kws = []
     rar = {"common": 0, "uncommon": 1, "rare": 2, "mythic": 3, "special": 3, "bonus": 3}.get(c.get("rarity"), 1)
     fmts = len(legal_formats(c))
     row = {
@@ -602,7 +623,7 @@ def ml_feature_row(c):
         "n_colors": len(ci),
         "n_formats": fmts,
         "n_formats_sq": fmts ** 2,
-        "n_keywords": len(c.get("keywords", [])),
+        "n_keywords": len(kws),
         "rarity_ord": rar,
         "reserved": 1 if c.get("reserved") else 0,
         "text_len": min(400, len(t)) / 400.0,
