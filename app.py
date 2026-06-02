@@ -2276,7 +2276,7 @@ with tab_market:
             st.altair_chart((bbase.mark_bar(color="#5294d6", cornerRadius=3).encode(tooltip=["Band", "Cards"])
                              + bbase.mark_text(dy=-6, color="#ece6d6", fontSize=11).encode(
                                  text=alt.condition("datum.Cards > 0", "Cards:Q", alt.value("")))
-                             ).properties(height=260), use_container_width=True)
+                             ).properties(height=260), width='stretch')
         with ec2:
             st.markdown("**Average price by role**  <span class='cap'>which card jobs cost the most</span>",
                         unsafe_allow_html=True)
@@ -2291,7 +2291,7 @@ with tab_market:
                                 tooltip=["Role", alt.Tooltip("Avg price:Q", format="$.2f")])
                              + rpbase.mark_text(dx=8, color="#ece6d6", fontSize=11).encode(
                                  text=alt.Tooltip("Avg price:Q", format="$.0f"))
-                             ).properties(height=260), use_container_width=True)
+                             ).properties(height=260), width='stretch')
     except Exception:
         pass
 
