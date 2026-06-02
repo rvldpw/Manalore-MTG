@@ -121,73 +121,80 @@ def load_library(target=TARGET):
 
 @st.cache_data(show_spinner=False, ttl=1800)
 def load_full_pool_from_hf(repo):
-    """Load the full card library from the most recent collector snapshot in HF.
-    Uses hf_hub_download (local cache) + pq.read_schema (reads only Parquet footer,
-    not the whole file) so we never download a large file twice.
-    Skips slim 4-column price-history partitions written by the importer."""
+    """Load the full card library from the most recent full-data snapshot in HF.
+    Uses direct requests download into BytesIO so there are no local-cache permission
+    issues on Streamlit Cloud. Reads only the Parquet schema footer first to identify
+    full snapshots cheaply, then reads the actual data for the right one."""
     if not repo:
         return None
     try:
-        import json as _json
+        import io, json as _json
         import pyarrow.parquet as pq
-        from huggingface_hub import HfApi, hf_hub_download
+        from huggingface_hub import HfApi
         api = HfApi()
-        # look in data/library/ first (new path), then fall back to data/snapshot_date=
-        # (old path where the collector may have written before the path change)
         all_files = api.list_repo_files(repo_id=repo, repo_type="dataset")
+        # check library/ (new path) then snapshot_date= (old path), newest first
         files = sorted([f for f in all_files
-                        if (f.startswith("data/library/snapshot_date=") or
+                        if (f.startswith("data/library/") or
                             f.startswith("data/snapshot_date="))
-                        and f.endswith(".parquet")])
+                        and f.endswith(".parquet")], reverse=True)
         if not files:
             return None
-        # scan newest-first; check only the Parquet schema (footer), not the whole file
-        local_full = None
-        for f in reversed(files):
-            try:
-                local = hf_hub_download(repo_id=repo, filename=f, repo_type="dataset")
-                col_names = pq.read_schema(local).names
-                if "oracle_text" in col_names and "type_line" in col_names:
-                    local_full = local
-                    break
-            except Exception:
-                continue
-        if local_full is None:
-            return None
+
         needed = ["name", "oracle_id", "set", "set_name", "set_type", "released_at",
                   "oracle_text", "type_line", "cmc", "mana_cost", "colors",
                   "color_identity", "keywords", "legalities", "rarity", "reserved",
                   "prices", "edhrec_rank", "img_normal", "img_art_crop",
                   "foil", "nonfoil", "finishes", "frame_effects", "border_color",
                   "full_art", "promo_types", "layout", "collector_number", "digital"]
-        existing = pq.read_schema(local_full).names
-        df = pd.read_parquet(local_full, columns=[c for c in needed if c in existing])
-        if "digital" in df.columns:
-            df = df[df["digital"] != True]
-        json_list_cols = ["colors", "color_identity", "keywords",
-                          "finishes", "promo_types", "frame_effects"]
-        json_dict_cols = ["prices", "legalities"]
-        for col in json_list_cols:
-            if col in df.columns:
-                df[col] = df[col].map(
-                    lambda x: (_json.loads(x) if isinstance(x, str) else x) or [])
-        for col in json_dict_cols:
-            if col in df.columns:
-                df[col] = df[col].map(
-                    lambda x: (_json.loads(x) if isinstance(x, str) else x) or {})
-        seen, cards = {}, []
-        for row in df.to_dict("records"):
-            if not row.get("name"):
+
+        for f in files:
+            url = (f"https://huggingface.co/datasets/{repo}/resolve/main/{f}"
+                   if not f.startswith("http") else f)
+            try:
+                r = requests.get(url, timeout=300,
+                                 headers={"User-Agent": "Manalore/1.0"})
+                if not r.ok:
+                    continue
+                buf = io.BytesIO(r.content)
+                # read schema from Parquet footer only (fast, no row data)
+                pf = pq.ParquetFile(buf)
+                col_names = pf.schema_arrow.names
+                if "oracle_text" not in col_names or "type_line" not in col_names:
+                    continue  # slim price-history file, skip it
+                # full snapshot found - read only needed columns
+                buf.seek(0)
+                read_cols = [c for c in needed if c in col_names]
+                df = pd.read_parquet(io.BytesIO(r.content), columns=read_cols)
+                if "digital" in df.columns:
+                    df = df[df["digital"] != True]
+                json_list_cols = ["colors", "color_identity", "keywords",
+                                  "finishes", "promo_types", "frame_effects"]
+                json_dict_cols = ["prices", "legalities"]
+                for col in json_list_cols:
+                    if col in df.columns:
+                        df[col] = df[col].map(
+                            lambda x: (_json.loads(x) if isinstance(x, str) else x) or [])
+                for col in json_dict_cols:
+                    if col in df.columns:
+                        df[col] = df[col].map(
+                            lambda x: (_json.loads(x) if isinstance(x, str) else x) or {})
+                seen, cards = {}, []
+                for row in df.to_dict("records"):
+                    if not row.get("name"):
+                        continue
+                    row["image_uris"] = {
+                        "normal": row.pop("img_normal", None),
+                        "art_crop": row.pop("img_art_crop", None),
+                    }
+                    key = row.get("oracle_id") or row.get("name")
+                    if key not in seen:
+                        seen[key] = True
+                        cards.append(row)
+                return cards if cards else None
+            except Exception:
                 continue
-            row["image_uris"] = {
-                "normal": row.pop("img_normal", None),
-                "art_crop": row.pop("img_art_crop", None),
-            }
-            key = row.get("oracle_id") or row.get("name")
-            if key not in seen:
-                seen[key] = True
-                cards.append(row)
-        return cards if cards else None
+        return None
     except Exception:
         return None
 
@@ -1626,14 +1633,31 @@ def card_sheet_body(c):
         st.markdown("<span class='cap'>Only one printing so far, so supply is concentrated in this release.</span>",
                     unsafe_allow_html=True)
 
-    # ---- ML: cards that play similarly (learned feature space) ----
+    # ---- ML: cards that play similarly (no dialog trigger inside a dialog) ----
     if c["name"] in ML_INDEX:
         sim_idx = ml_similar(ML, ML_NAMES, ML_INDEX[c["name"]], k=6)
-        sims = [POOL[i] for i in sim_idx]
+        sims = [POOL[i] for i in sim_idx if i < len(POOL)]
         if sims:
-            st.markdown("**Plays like this**  <span class='cap'>cards the model finds most similar, "
-                        "useful as swaps or deck-mates</span>", unsafe_allow_html=True)
-            card_tiles(sims, "mlsim", 6, 6)
+            st.markdown("**Plays like this**  <span class='cap'>cards the model finds most similar "
+                        "in feature space, useful as swaps or deck-mates</span>",
+                        unsafe_allow_html=True)
+            sim_cols = st.columns(len(sims))
+            for i, sc in enumerate(sims):
+                with sim_cols[i]:
+                    art = img_uri(sc, "art_crop") or ""
+                    if art:
+                        st.markdown(f"<img class='cardart' src='{art}' alt=''>",
+                                    unsafe_allow_html=True)
+                    st.markdown(f"<div class='tname'>{sc['name'][:22]}</div>"
+                                f"<span class='cap'>{fmt_usd(price_now(sc))}</span>",
+                                unsafe_allow_html=True)
+                    in_b = sc["name"] in [x["name"] for x in SS["basket"]]
+                    if st.button("＋" if not in_b else "✓",
+                                 key=f"sim_add_{i}_{sc.get('id', sc['name'])}",
+                                 help=f"Add {sc['name']} to deck builder"):
+                        if not in_b:
+                            SS["basket"].append(sc)
+                            st.toast(f"Added {sc['name']}")
 
 
 @st.dialog(" ", width="large")
