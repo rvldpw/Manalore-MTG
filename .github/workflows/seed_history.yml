@@ -1,23 +1,30 @@
 name: Seed historical price data (run once)
 
 on:
-  workflow_dispatch: {}   # only runs when you click "Run workflow" manually
+  workflow_dispatch: {}   # only runs when you click Run workflow manually
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   seed:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests pandas pyarrow huggingface_hub ijson
+        run: |
+          pip install --upgrade pip
+          pip install requests pandas pyarrow huggingface_hub ijson
 
       - name: Run historical importer
         env:
