@@ -54,7 +54,7 @@ def load_price_history(repo, max_snapshots=120):
         import json as _json
         api = HfApi()
         files = api.list_repo_files(repo_id=repo, repo_type="dataset")
-        parts = sorted([f for f in files if f.startswith("data/snapshot_date=") and f.endswith(".parquet")])
+        parts = sorted([f for f in files if f.startswith("data/prices/snapshot_date=") and f.endswith(".parquet")])
         parts = parts[-max_snapshots:]
         if not parts:
             return None
@@ -133,7 +133,7 @@ def load_full_pool_from_hf(repo):
         from huggingface_hub import HfApi, hf_hub_download
         api = HfApi()
         files = sorted([f for f in api.list_repo_files(repo_id=repo, repo_type="dataset")
-                        if f.startswith("data/snapshot_date=") and f.endswith(".parquet")])
+                        if f.startswith("data/library/snapshot_date=") and f.endswith(".parquet")])
         if not files:
             return None
         # scan newest-first; check only the Parquet schema (footer), not the whole file
