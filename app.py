@@ -1346,7 +1346,7 @@ st.markdown(
     "<div class='wordmark'>MANALORE</div>"
     "<div class='subtitle'>ACADEMY OF CARD MASTERY</div>"
     f"<div class='statusbar'><span class='dot'>●</span> Live market data, updated {stamp}"
-    f"&nbsp;&nbsp;·&nbsp;&nbsp;tracking the {len(POOL):,} most-played cards"
+    f"&nbsp;&nbsp;·&nbsp;&nbsp;Tracking the most-played cards"
     + (f"&nbsp;&nbsp;·&nbsp;&nbsp;{HIST['snapshot_date'].nunique()} days of price history"
        if (HIST is not None and len(HIST)) else "")
     + "</div>"
