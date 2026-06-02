@@ -98,7 +98,7 @@ def card_history(hist, name):
 # ----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=1800)
 def load_library(target=TARGET):
-    """The most-played cards, newest data each session (30 min cache)."""
+    """Fallback: the most-played cards from the live API (used when HF is not configured)."""
     out, url = [], (f"{API}/cards/search?q=" +
                     requests.utils.quote("-is:digital -t:basic legal:commander") +
                     "&order=edhrec&unique=cards")
@@ -117,6 +117,67 @@ def load_library(target=TARGET):
         if url:
             time.sleep(0.08)
     return out[:target]
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def load_full_pool_from_hf(repo):
+    """Load the FULL card library from the most recent HF snapshot.
+    Returns a list of card dicts (no limit), or None if HF is not configured.
+    Deduplicates by oracle_id so each unique card appears once.
+    Falls back gracefully on any error."""
+    if not repo:
+        return None
+    try:
+        import json as _json
+        from huggingface_hub import HfApi
+        api = HfApi()
+        files = sorted([f for f in api.list_repo_files(repo_id=repo, repo_type="dataset")
+                        if f.startswith("data/snapshot_date=") and f.endswith(".parquet")])
+        if not files:
+            return None
+        latest = files[-1]
+        url = f"https://huggingface.co/datasets/{repo}/resolve/main/{latest}"
+        needed = ["name", "oracle_id", "set", "set_name", "set_type", "released_at",
+                  "oracle_text", "type_line", "cmc", "mana_cost", "colors",
+                  "color_identity", "keywords", "legalities", "rarity", "reserved",
+                  "prices", "edhrec_rank", "img_normal", "img_art_crop",
+                  "foil", "nonfoil", "finishes", "frame_effects", "border_color",
+                  "full_art", "promo_types", "layout", "collector_number", "digital"]
+        try:
+            df = pd.read_parquet(url, columns=[c for c in needed])
+        except Exception:
+            df = pd.read_parquet(url)
+        # drop digital-only cards
+        if "digital" in df.columns:
+            df = df[df["digital"] != True]
+        # parse JSON-encoded columns back to Python objects
+        json_list_cols = ["colors", "color_identity", "keywords", "finishes",
+                          "promo_types", "frame_effects"]
+        json_dict_cols = ["prices", "legalities"]
+        for col in json_list_cols:
+            if col in df.columns:
+                df[col] = df[col].map(
+                    lambda x: (_json.loads(x) if isinstance(x, str) else x) or [])
+        for col in json_dict_cols:
+            if col in df.columns:
+                df[col] = df[col].map(
+                    lambda x: (_json.loads(x) if isinstance(x, str) else x) or {})
+        # rebuild card dicts and deduplicate by oracle_id
+        seen, cards = {}, []
+        for row in df.to_dict("records"):
+            if not row.get("name"):
+                continue
+            row["image_uris"] = {
+                "normal": row.pop("img_normal", None),
+                "art_crop": row.pop("img_art_crop", None),
+            }
+            key = row.get("oracle_id") or row.get("name")
+            if key not in seen:
+                seen[key] = True
+                cards.append(row)
+        return cards if cards else None
+    except Exception:
+        return None
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -579,7 +640,7 @@ TS_FEATURE_ORDER = ["mom_7d", "mom_14d", "mom_30d", "vol_14d", "vol_30d",
 def train_models(_pool_sig, rows, prices, ranks):
     out = {"ok": False}
     try:
-        from sklearn.ensemble import GradientBoostingRegressor, HistGradientBoostingRegressor
+        from sklearn.ensemble import HistGradientBoostingRegressor
         from sklearn.neighbors import NearestNeighbors
         from sklearn.preprocessing import StandardScaler
         from sklearn.model_selection import cross_val_score
@@ -587,53 +648,62 @@ def train_models(_pool_sig, rows, prices, ranks):
         return out
 
     X = np.array([[r[k] for k in ML_FEATURE_ORDER] for r in rows], dtype=float)
+    n_total = len(X)
 
-    # price model
+    # ---- price model ----
     price_idx = [i for i, p in enumerate(prices) if p and p > 0]
     if len(price_idx) >= 150:
         Xp = X[price_idx]
         yp = np.log1p(np.array([prices[i] for i in price_idx], dtype=float))
         price_model = HistGradientBoostingRegressor(
-            max_depth=5, max_iter=280, learning_rate=0.055,
-            l2_regularization=0.8, min_samples_leaf=12, random_state=7)
+            max_depth=5, max_iter=300, learning_rate=0.05,
+            l2_regularization=0.8, min_samples_leaf=15, random_state=7)
         price_model.fit(Xp, yp)
+        # CV on a sample so large pools don't time out
+        cv_n = min(len(Xp), 8000)
+        idx_cv = np.random.RandomState(42).choice(len(Xp), cv_n, replace=False)
         try:
-            r2 = float(np.mean(cross_val_score(price_model, Xp, yp, cv=5, scoring="r2")))
+            r2 = float(np.mean(cross_val_score(price_model, Xp[idx_cv], yp[idx_cv],
+                                                cv=5, scoring="r2")))
         except Exception:
             r2 = float("nan")
         out["price_model"] = price_model
         out["price_r2"] = r2
         out["price_n"] = len(price_idx)
-        # feature importance
         try:
-            fi = price_model.feature_importances_
-            out["price_feat_imp"] = dict(zip(ML_FEATURE_ORDER, fi.tolist()))
+            out["price_feat_imp"] = dict(zip(ML_FEATURE_ORDER,
+                                             price_model.feature_importances_.tolist()))
         except Exception:
             pass
 
-    # importance model
+    # ---- importance model (HistGBM scales to 100K+) ----
     inv_rank = 10 - np.clip(np.log10(np.array(ranks, dtype=float) + 1) * 2.05, 0, 10)
     breadth = np.clip(np.array([r["n_formats"] for r in rows]) * 1.55, 0, 10)
     y_imp = np.clip((0.7 * inv_rank + 0.3 * breadth) / 10 * 100, 0, 100)
-    imp_model = GradientBoostingRegressor(
-        max_depth=4, n_estimators=250, learning_rate=0.045,
-        subsample=0.85, random_state=7)
+    imp_model = HistGradientBoostingRegressor(
+        max_depth=4, max_iter=260, learning_rate=0.05,
+        l2_regularization=0.5, min_samples_leaf=12, random_state=7)
     imp_model.fit(X, y_imp)
+    cv_n2 = min(n_total, 8000)
+    idx_cv2 = np.random.RandomState(42).choice(n_total, cv_n2, replace=False)
     try:
-        imp_r2 = float(np.mean(cross_val_score(imp_model, X, y_imp, cv=5, scoring="r2")))
+        imp_r2 = float(np.mean(cross_val_score(imp_model, X[idx_cv2], y_imp[idx_cv2],
+                                                cv=5, scoring="r2")))
     except Exception:
         imp_r2 = float("nan")
     out["imp_model"] = imp_model
     out["imp_r2"] = imp_r2
     try:
-        out["imp_feat_imp"] = dict(zip(ML_FEATURE_ORDER, imp_model.feature_importances_.tolist()))
+        out["imp_feat_imp"] = dict(zip(ML_FEATURE_ORDER,
+                                       imp_model.feature_importances_.tolist()))
     except Exception:
         pass
 
-    # similarity (NearestNeighbors)
+    # ---- similarity (NearestNeighbors handles 100K fine) ----
     scaler = StandardScaler().fit(X)
     Xs = scaler.transform(X)
-    nn = NearestNeighbors(n_neighbors=min(15, len(rows)), metric="cosine").fit(Xs)
+    nn = NearestNeighbors(n_neighbors=min(15, n_total), metric="cosine",
+                          algorithm="brute").fit(Xs)
     out["scaler"] = scaler
     out["nn"] = nn
     out["X"] = X
@@ -1308,7 +1378,13 @@ def score_color(v):
 
 # ---- header ----
 with st.spinner("Opening the library..."):
-    POOL = [c for c in load_library() if c.get("name")]
+    _hf_pool = load_full_pool_from_hf(HF_REPO)
+    if _hf_pool and len(_hf_pool) > TARGET:
+        POOL = [c for c in _hf_pool if c.get("name")]
+        _pool_source = "hf"
+    else:
+        POOL = [c for c in load_library() if c.get("name")]
+        _pool_source = "api"
 
 if not POOL:
     st.error("Could not reach the live card service right now. Please reload the page in a moment.")
@@ -1340,13 +1416,15 @@ if HIST is not None and len(HIST) >= 80:
     FORECASTER = train_forecaster(_hist_sig, _hist_rows_compact, _attr_by_name)
 
 stamp = time.strftime("%I:%M %p").lstrip("0")
+_pool_desc = (f"all {len(POOL):,} known cards" if _pool_source == "hf"
+              else f"the {len(POOL):,} most-played cards")
 st.markdown(
     "<div class='masthead'>"
     "<div class='crest'>✦</div>"
     "<div class='wordmark'>MANALORE</div>"
     "<div class='subtitle'>ACADEMY OF CARD MASTERY</div>"
     f"<div class='statusbar'><span class='dot'>●</span> Live market data, updated {stamp}"
-    f"&nbsp;&nbsp;·&nbsp;&nbsp;Tracking the most-played cards"
+    f"&nbsp;&nbsp;·&nbsp;&nbsp;tracking {_pool_desc}"
     + (f"&nbsp;&nbsp;·&nbsp;&nbsp;{HIST['snapshot_date'].nunique()} days of price history"
        if (HIST is not None and len(HIST)) else "")
     + "</div>"
@@ -1589,9 +1667,13 @@ def card_tiles(cards, where, cols_n=5, limit=40):
 # LIBRARY
 # ============================================================================
 with tab_lib:
-    st.markdown("<div class='hero'><h2>Read any card like a master.</h2>"
-                "<p>Thousands of the most-played cards, each scored for power, demand and price outlook, "
-                "in plain language for newcomers and full depth for veterans.</p></div>", unsafe_allow_html=True)
+    _lib_desc = (f"Every known Magic card ({len(POOL):,} unique cards) from all sets and all time, "
+                 if _pool_source == "hf" else
+                 f"The {len(POOL):,} most-played cards, ")
+    st.markdown(f"<div class='hero'><h2>Read any card like a master.</h2>"
+                f"<p>{_lib_desc}each scored for power, demand and price outlook, "
+                "in plain language for newcomers and full depth for veterans.</p></div>",
+                unsafe_allow_html=True)
 
     avg_dem = int(np.mean([demand(c) for c in POOL]))
     priced_pool = [c for c in POOL if price_now(c)]
