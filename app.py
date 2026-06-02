@@ -686,7 +686,8 @@ TS_FEATURE_ORDER = ["mom_7d", "mom_14d", "mom_30d", "vol_14d", "vol_30d",
 
 # ---- snapshot models (trained once per library load) ----
 @st.cache_resource(show_spinner=False)
-def train_models(_pool_sig, rows, prices, ranks):
+def train_models(_pool_sig, _rows, _prices, _ranks):
+    rows, prices, ranks = _rows, _prices, _ranks
     out = {"ok": False}
     try:
         from sklearn.ensemble import HistGradientBoostingRegressor
@@ -765,14 +766,16 @@ def train_models(_pool_sig, rows, prices, ranks):
 
 
 @st.cache_data(show_spinner=False)
-def build_ml(_pool_sig, names, rows, prices, ranks):
+def build_ml(_pool_sig, _names, _rows, _prices, _ranks):
+    rows, prices, ranks = _rows, _prices, _ranks
     models = train_models(_pool_sig, rows, prices, ranks)
-    return models, names
+    return models, _names
 
 
 # ---- time-series forecaster (trained on HF history) ----
 @st.cache_resource(show_spinner=False)
-def train_forecaster(_hist_sig, hist_parquet_rows, attr_rows_by_name):
+def train_forecaster(_hist_sig, _hist_parquet_rows, _attr_rows_by_name):
+    hist_parquet_rows, attr_rows_by_name = _hist_parquet_rows, _attr_rows_by_name
     """Train a 30-day price forecaster on accumulated price history.
     Creates sliding-window training examples: features at day t -> return at t+30.
     Uses time-based validation (older data trains, newest 20% tests) for honest metrics."""
