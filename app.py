@@ -121,31 +121,33 @@ def load_library(target=TARGET):
 
 @st.cache_data(show_spinner=False, ttl=1800)
 def load_full_pool_from_hf(repo):
-    """Load the FULL card library from the most recent HF snapshot that has complete card data.
-    Slim price-history partitions (only 4 cols from the importer) are skipped.
-    Returns a list of card dicts, or None if no full snapshot exists yet."""
+    """Load the full card library from the most recent collector snapshot in HF.
+    Uses hf_hub_download (local cache) + pq.read_schema (reads only Parquet footer,
+    not the whole file) so we never download a large file twice.
+    Skips slim 4-column price-history partitions written by the importer."""
     if not repo:
         return None
     try:
         import json as _json
-        from huggingface_hub import HfApi
+        import pyarrow.parquet as pq
+        from huggingface_hub import HfApi, hf_hub_download
         api = HfApi()
         files = sorted([f for f in api.list_repo_files(repo_id=repo, repo_type="dataset")
                         if f.startswith("data/snapshot_date=") and f.endswith(".parquet")])
         if not files:
             return None
-        # Scan newest-first for a full partition (collector ~40 cols vs importer 4 cols)
-        full_url = None
+        # scan newest-first; check only the Parquet schema (footer), not the whole file
+        local_full = None
         for f in reversed(files):
-            url = f"https://huggingface.co/datasets/{repo}/resolve/main/{f}"
             try:
-                probe = pd.read_parquet(url).columns.tolist()
-                if "oracle_text" in probe and "type_line" in probe:
-                    full_url = url
+                local = hf_hub_download(repo_id=repo, filename=f, repo_type="dataset")
+                col_names = pq.read_schema(local).names
+                if "oracle_text" in col_names and "type_line" in col_names:
+                    local_full = local
                     break
             except Exception:
                 continue
-        if full_url is None:
+        if local_full is None:
             return None
         needed = ["name", "oracle_id", "set", "set_name", "set_type", "released_at",
                   "oracle_text", "type_line", "cmc", "mana_cost", "colors",
@@ -153,14 +155,12 @@ def load_full_pool_from_hf(repo):
                   "prices", "edhrec_rank", "img_normal", "img_art_crop",
                   "foil", "nonfoil", "finishes", "frame_effects", "border_color",
                   "full_art", "promo_types", "layout", "collector_number", "digital"]
-        try:
-            df = pd.read_parquet(full_url, columns=[c for c in needed])
-        except Exception:
-            df = pd.read_parquet(full_url)
+        existing = pq.read_schema(local_full).names
+        df = pd.read_parquet(local_full, columns=[c for c in needed if c in existing])
         if "digital" in df.columns:
             df = df[df["digital"] != True]
-        json_list_cols = ["colors", "color_identity", "keywords", "finishes",
-                          "promo_types", "frame_effects"]
+        json_list_cols = ["colors", "color_identity", "keywords",
+                          "finishes", "promo_types", "frame_effects"]
         json_dict_cols = ["prices", "legalities"]
         for col in json_list_cols:
             if col in df.columns:
@@ -170,57 +170,6 @@ def load_full_pool_from_hf(repo):
             if col in df.columns:
                 df[col] = df[col].map(
                     lambda x: (_json.loads(x) if isinstance(x, str) else x) or {})
-        seen, cards = {}, []
-        for row in df.to_dict("records"):
-            if not row.get("name"):
-                continue
-            row["image_uris"] = {
-                "normal": row.pop("img_normal", None),
-                "art_crop": row.pop("img_art_crop", None),
-            }
-            key = row.get("oracle_id") or row.get("name")
-            if key not in seen:
-                seen[key] = True
-                cards.append(row)
-        return cards if cards else None
-    except Exception:
-        return None
-    try:
-        import json as _json
-        from huggingface_hub import HfApi
-        api = HfApi()
-        files = sorted([f for f in api.list_repo_files(repo_id=repo, repo_type="dataset")
-                        if f.startswith("data/snapshot_date=") and f.endswith(".parquet")])
-        if not files:
-            return None
-        latest = files[-1]
-        url = f"https://huggingface.co/datasets/{repo}/resolve/main/{latest}"
-        needed = ["name", "oracle_id", "set", "set_name", "set_type", "released_at",
-                  "oracle_text", "type_line", "cmc", "mana_cost", "colors",
-                  "color_identity", "keywords", "legalities", "rarity", "reserved",
-                  "prices", "edhrec_rank", "img_normal", "img_art_crop",
-                  "foil", "nonfoil", "finishes", "frame_effects", "border_color",
-                  "full_art", "promo_types", "layout", "collector_number", "digital"]
-        try:
-            df = pd.read_parquet(url, columns=[c for c in needed])
-        except Exception:
-            df = pd.read_parquet(url)
-        # drop digital-only cards
-        if "digital" in df.columns:
-            df = df[df["digital"] != True]
-        # parse JSON-encoded columns back to Python objects
-        json_list_cols = ["colors", "color_identity", "keywords", "finishes",
-                          "promo_types", "frame_effects"]
-        json_dict_cols = ["prices", "legalities"]
-        for col in json_list_cols:
-            if col in df.columns:
-                df[col] = df[col].map(
-                    lambda x: (_json.loads(x) if isinstance(x, str) else x) or [])
-        for col in json_dict_cols:
-            if col in df.columns:
-                df[col] = df[col].map(
-                    lambda x: (_json.loads(x) if isinstance(x, str) else x) or {})
-        # rebuild card dicts and deduplicate by oracle_id
         seen, cards = {}, []
         for row in df.to_dict("records"):
             if not row.get("name"):
