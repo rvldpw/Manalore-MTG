@@ -132,13 +132,13 @@ def load_library(target=TARGET):
 @st.cache_data(show_spinner=False, ttl=1800)
 def load_full_pool_from_hf(repo, token=None):
     """Load the full card library from HF by trying recent dates directly.
-    Bypasses list_repo_files() entirely - accesses files by known date pattern.
+    Streams only needed columns, sorts by play-rate, caps the pool for memory safety.
     Returns (cards_list, status_message)."""
     if not repo:
         return None, "no repo configured"
+    HF_POOL_CAP = 1500   # kept small for Streamlit free-tier memory; full data stays in HF
     try:
         import io, json as _json, datetime
-        import pyarrow.parquet as pq
 
         hdrs = {"User-Agent": "Manalore/1.0"}
         if token:
@@ -152,7 +152,7 @@ def load_full_pool_from_hf(repo, token=None):
                   "full_art", "promo_types", "layout", "collector_number", "digital"]
 
         today = datetime.date.today()
-        # try last 30 days, checking both data/library/ and data/snapshot_date= paths
+        # try last 30 days
         for days_back in range(30):
             date_str = (today - datetime.timedelta(days=days_back)).isoformat()
             paths_to_try = [
@@ -165,19 +165,28 @@ def load_full_pool_from_hf(repo, token=None):
                     r = requests.get(url, timeout=300, headers=hdrs)
                     if not r.ok:
                         continue
+                    # single download into one buffer, read only needed columns from it
                     buf = io.BytesIO(r.content)
-                    pf = pq.ParquetFile(buf)
-                    try:
-                        col_names = list(pf.schema_arrow.names)
-                    except AttributeError:
-                        col_names = list(pf.schema.names)
-                    if "oracle_text" not in col_names or "type_line" not in col_names:
+                    import pyarrow.parquet as pq
+                    schema_names = pq.ParquetFile(buf).schema_arrow.names
+                    if "oracle_text" not in schema_names or "type_line" not in schema_names:
                         continue
-                    # full snapshot found
-                    read_cols = [c for c in needed if c in col_names]
-                    df = pd.read_parquet(io.BytesIO(r.content), columns=read_cols)
+                    buf.seek(0)
+                    read_cols = [c for c in needed if c in schema_names]
+                    df = pd.read_parquet(buf, columns=read_cols)
+                    del buf  # free the raw bytes buffer asap
+                    # filter digital, sort by play-rate, cap early to save RAM
                     if "digital" in df.columns:
                         df = df[df["digital"] != True]
+                    def _safe_rank(x):
+                        try:
+                            v = float(x)
+                            return v if v == v and v > 0 else 99999
+                        except: return 99999
+                    if "edhrec_rank" in df.columns:
+                        df = df.assign(_r=df["edhrec_rank"].map(_safe_rank))
+                        df = df.sort_values("_r").drop(columns=["_r"])
+                    df = df.head(HF_POOL_CAP)
                     json_list = ["colors","color_identity","keywords",
                                  "finishes","promo_types","frame_effects"]
                     json_dict = ["prices","legalities"]
@@ -1434,51 +1443,56 @@ def score_color(v):
 
 # ---- header ----
 with st.spinner("Opening the library..."):
-    _hf_result = load_full_pool_from_hf(HF_REPO, HF_TOKEN_VAL)
-    if isinstance(_hf_result, tuple):
-        _hf_pool, _hf_status = _hf_result
-    else:
-        _hf_pool, _hf_status = _hf_result, "legacy return"
-    if _hf_pool and len(_hf_pool) > TARGET:
-        # Sort by play-rate (edhrec_rank ascending = most played first)
-        # Cap at 10,000 so the app stays fast; full data remains in HF for history/ML
-        HF_POOL_LIMIT = 2500
-        def _rank_key(c):
-            try:
-                r = float(c.get("edhrec_rank") or 99999)
-                return r if r == r else 99999
-            except (TypeError, ValueError):
-                return 99999
-        _hf_pool_sorted = sorted(_hf_pool, key=_rank_key)[:HF_POOL_LIMIT]
-        POOL = [c for c in _hf_pool_sorted if c.get("name")]
-        _pool_source = "hf"
-    else:
-        POOL = [c for c in load_library() if c.get("name")]
-        _pool_source = "api"
+    POOL = []
+    _pool_source = "api"
+    _hf_status = "not attempted"
+    # Try HF first, but never let it hang or crash the boot
+    try:
+        _hf_result = load_full_pool_from_hf(HF_REPO, HF_TOKEN_VAL)
+        if isinstance(_hf_result, tuple):
+            _hf_pool, _hf_status = _hf_result
+        else:
+            _hf_pool, _hf_status = _hf_result, "legacy"
+        if _hf_pool and len(_hf_pool) >= 1000:
+            POOL = [c for c in _hf_pool if c.get("name")]
+            _pool_source = "hf"
+    except Exception as _e:
+        _hf_status = f"error: {_e}"
+        POOL = []
+    # Fall back to lightweight API library if HF did not yield a pool
+    if not POOL:
+        try:
+            POOL = [c for c in load_library() if c.get("name")]
+            _pool_source = "api"
+        except Exception:
+            POOL = []
 
 if not POOL:
     st.error("Could not reach the live card service right now. Please reload the page in a moment.")
     st.stop()
 
-# ---- train ML models on the scraped library (cached) ----
-for _c in POOL:
-    feats(_c)
-_ml_names = [c["name"] for c in POOL]
-_ml_rows = [ml_feature_row(c) for c in POOL]
-_ml_prices = [price_now(c) for c in POOL]
+# ---- train ML models on the library (cached, fail-safe) ----
+try:
+    for _c in POOL:
+        feats(_c)
+    _ml_names = [c["name"] for c in POOL]
+    _ml_rows = [ml_feature_row(c) for c in POOL]
+    _ml_prices = [price_now(c) for c in POOL]
 
-def _safe_rank(c):
-    r = c.get("edhrec_rank")
-    try:
-        r = float(r)
-        return r if (r == r and r > 0) else 60000
-    except (TypeError, ValueError):
-        return 60000
+    def _safe_rank(c):
+        r = c.get("edhrec_rank")
+        try:
+            r = float(r)
+            return r if (r == r and r > 0) else 60000
+        except (TypeError, ValueError):
+            return 60000
 
-_ml_ranks = [_safe_rank(c) for c in POOL]
-_pool_sig = f"{len(POOL)}-{_ml_names[0] if _ml_names else ''}-{_ml_names[-1] if _ml_names else ''}"
-ML, ML_NAMES = build_ml(_pool_sig, _ml_names, _ml_rows, _ml_prices, _ml_ranks)
-ML_INDEX = {n: i for i, n in enumerate(ML_NAMES)}
+    _ml_ranks = [_safe_rank(c) for c in POOL]
+    _pool_sig = f"{len(POOL)}-{_ml_names[0] if _ml_names else ''}-{_ml_names[-1] if _ml_names else ''}"
+    ML, ML_NAMES = build_ml(_pool_sig, _ml_names, _ml_rows, _ml_prices, _ml_ranks)
+    ML_INDEX = {n: i for i, n in enumerate(ML_NAMES)}
+except Exception as _ml_err:
+    ML, ML_NAMES, ML_INDEX = {"ok": False}, [], {}
 
 # real accumulated price history from Hugging Face, if configured
 HIST = load_price_history(HF_REPO, HF_TOKEN_VAL)
