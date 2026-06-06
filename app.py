@@ -161,23 +161,41 @@ def load_full_pool_from_hf(repo, token=None):
             ]
             for path in paths_to_try:
                 url = f"https://huggingface.co/datasets/{repo}/resolve/main/{path}"
+                tmp_path = None
                 try:
-                    r = requests.get(url, timeout=300, headers=hdrs)
-                    if not r.ok:
-                        continue
-                    # single download into one buffer, read only needed columns from it
-                    buf = io.BytesIO(r.content)
+                    import tempfile, os
                     import pyarrow.parquet as pq
-                    schema_names = pq.ParquetFile(buf).schema_arrow.names
+                    import pyarrow as pa
+                    # stream download to a temp file on DISK (not RAM) in chunks
+                    with requests.get(url, timeout=300, headers=hdrs, stream=True) as r:
+                        if not r.ok:
+                            continue
+                        fd, tmp_path = tempfile.mkstemp(suffix=".parquet")
+                        with os.fdopen(fd, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=1 << 20):
+                                if chunk:
+                                    f.write(chunk)
+                    pf = pq.ParquetFile(tmp_path)
+                    schema_names = pf.schema_arrow.names
                     if "oracle_text" not in schema_names or "type_line" not in schema_names:
+                        os.unlink(tmp_path); tmp_path = None
                         continue
-                    buf.seek(0)
                     read_cols = [c for c in needed if c in schema_names]
-                    df = pd.read_parquet(buf, columns=read_cols)
-                    del buf  # free the raw bytes buffer asap
-                    # filter digital, sort by play-rate, cap early to save RAM
-                    if "digital" in df.columns:
-                        df = df[df["digital"] != True]
+                    # read row-group by row-group, keep only the most-played cards,
+                    # so we never hold the whole table in RAM at once
+                    collected = []
+                    for rg in range(pf.num_row_groups):
+                        tbl = pf.read_row_group(rg, columns=read_cols)
+                        sub = tbl.to_pandas()
+                        if "digital" in sub.columns:
+                            sub = sub[sub["digital"] != True]
+                        collected.append(sub)
+                        # early exit once we clearly have enough to sort from
+                        if sum(len(x) for x in collected) > HF_POOL_CAP * 12:
+                            break
+                    os.unlink(tmp_path); tmp_path = None
+                    df = pd.concat(collected, ignore_index=True)
+                    del collected
                     def _safe_rank(x):
                         try:
                             v = float(x)
@@ -186,7 +204,7 @@ def load_full_pool_from_hf(repo, token=None):
                     if "edhrec_rank" in df.columns:
                         df = df.assign(_r=df["edhrec_rank"].map(_safe_rank))
                         df = df.sort_values("_r").drop(columns=["_r"])
-                    df = df.head(HF_POOL_CAP)
+                    df = df.head(HF_POOL_CAP).copy()
                     json_list = ["colors","color_identity","keywords",
                                  "finishes","promo_types","frame_effects"]
                     json_dict = ["prices","legalities"]
@@ -211,6 +229,11 @@ def load_full_pool_from_hf(repo, token=None):
                             cards.append(row)
                     return cards, f"loaded {len(cards):,} cards from {path}"
                 except Exception as e:
+                    try:
+                        if tmp_path:
+                            import os; os.unlink(tmp_path)
+                    except Exception:
+                        pass
                     continue
         return None, "no full snapshot found in last 30 days"
     except Exception as e:
